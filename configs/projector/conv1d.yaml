@@ -1,0 +1,5 @@
+# Conv1d projector — SLAM-LLM style, non-overlapping conv + MLP
+name: conv1d
+kwargs:
+  downsample_factor: 5
+  hidden_dim: 2048

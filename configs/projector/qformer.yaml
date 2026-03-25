@@ -1,0 +1,7 @@
+# Q-Former projector — BLIP-2 style cross-attention with learnable queries
+# Fixed output length = num_queries regardless of input length
+name: qformer
+kwargs:
+  num_queries: 64
+  num_layers: 6
+  hidden_dim: 768

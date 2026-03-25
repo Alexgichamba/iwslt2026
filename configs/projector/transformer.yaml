@@ -1,0 +1,9 @@
+# Transformer projector — self-attention layers + linear, preserves sequence length
+# Use with CTC compression or set downsample_factor > 1 for pre-pooling
+name: transformer
+kwargs:
+  num_layers: 4
+  num_heads: 8
+  ffn_dim: 2048
+  dropout: 0.1
+  downsample_factor: 5    # avg pool before transformer (set 1 for no downsampling)
