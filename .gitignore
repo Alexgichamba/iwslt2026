@@ -1,6 +1,6 @@
 *.egg-info/
 *.pyc
 *.out
-run.sh
+run*.sh
 wandb/
 checkpoints/
