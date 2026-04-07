@@ -86,12 +86,17 @@ class SimpleCollator:
             return_tensors="pt",
         )
 
+        labels = tokenized["input_ids"].clone()
+        labels[labels == self.tokenizer.pad_token_id] = -100
+        if self.tokenizer.bos_token_id is not None:
+            labels[labels == self.tokenizer.bos_token_id] = -100
+
         return {
             "features": padded_features,
             "feature_lengths": feature_lengths,
             "text_input_ids": tokenized["input_ids"],
             "text_attention_mask": tokenized["attention_mask"],
-            "labels": tokenized["input_ids"].clone(),
+            "labels": labels
         }
 
 
@@ -143,12 +148,17 @@ class CoTSTCollator:
             return_tensors="pt",
         )
 
+        labels = tokenized["input_ids"].clone()
+        labels[labels == self.tokenizer.pad_token_id] = -100
+        if self.tokenizer.bos_token_id is not None:
+            labels[labels == self.tokenizer.bos_token_id] = -100
+
         return {
             "features": padded_features,
             "feature_lengths": feature_lengths,
             "text_input_ids": tokenized["input_ids"],
             "text_attention_mask": tokenized["attention_mask"],
-            "labels": tokenized["input_ids"].clone(),
+            "labels": labels
         }
 
 
@@ -219,6 +229,8 @@ def validate(
     num_batches = 0
     all_preds = []
     all_refs = []
+    all_cot_transcript_preds = []
+    all_cot_transcript_refs = []
 
     for batch_idx, batch in enumerate(loader):
         if max_val_batches is not None and batch_idx >= max_val_batches:
@@ -265,6 +277,13 @@ def validate(
                 ref_text = _extract_text(ref_text, "cot_st", "translation")
             all_refs.append(ref_text)
 
+        if task == "cot_st":
+            for i, raw_pred in enumerate(generations):
+                all_cot_transcript_preds.append(_extract_text(raw_pred, "cot_st", "transcript"))
+                ref_ids = labels[i][labels[i] != -100].tolist()
+                ref_text = model.llm.tokenizer.decode(ref_ids, skip_special_tokens=True)
+                all_cot_transcript_refs.append(_extract_text(ref_text, "cot_st", "transcript"))
+
     avg_loss = total_loss / max(num_batches, 1)
     metrics = {"val/loss": avg_loss}
 
@@ -279,17 +298,9 @@ def validate(
         metrics["val/bleu"] = bleu
 
     # For CoT, also compute WER on the transcript part
-    if task == "cot_st":
+    if task == "cot_st" and all_cot_transcript_refs:
         from st.utils.metrics import compute_wer
-        cot_transcript_preds = []
-        cot_transcript_refs = []
-        for i, raw_pred in enumerate(generations):
-            cot_transcript_preds.append(_extract_text(raw_pred, "cot_st", "transcript"))
-            ref_ids = labels[i][labels[i] != -100].tolist()
-            ref_text = model.llm.tokenizer.decode(ref_ids, skip_special_tokens=True)
-            cot_transcript_refs.append(_extract_text(ref_text, "cot_st", "transcript"))
-        if cot_transcript_refs:
-            metrics["val/transcript_wer"] = compute_wer(cot_transcript_preds, cot_transcript_refs)
+        metrics["val/transcript_wer"] = compute_wer(all_cot_transcript_preds, all_cot_transcript_refs)
 
     # Save predictions CSV
     if output_dir is not None:

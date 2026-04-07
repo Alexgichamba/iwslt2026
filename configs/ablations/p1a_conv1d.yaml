@@ -14,21 +14,13 @@ projector:
     downsample_factor: 5
     hidden_dim: 2048
 llm:
-  model_name_or_path: McGill-NLP/AfriqueGemma-4B
+  model_name_or_path: Qwen/Qwen3-0.6B
   dtype: bfloat16
-  freeze: true
-  lora:
-    r: 8
-    lora_alpha: 16
-    lora_dropout: 0.05
-    target_modules:
-    - q_proj
-    - v_proj
-    - k_proj
-    - o_proj
+  freeze: false
+  lora: null
 
 training:
-  batch_size: 8
+  batch_size: 16
   lr: 1.0e-05
   weight_decay: 0.01
   total_steps: 25000
