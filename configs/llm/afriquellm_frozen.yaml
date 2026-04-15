@@ -1,5 +1,0 @@
-# AfriqueLLM — frozen, no LoRA (stage 2 projector-only training)
-model_name_or_path: "McGill-NLP/AfriqueGemma-4B"
-dtype: bfloat16
-freeze: true
-lora: null

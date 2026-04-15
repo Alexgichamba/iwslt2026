@@ -4,3 +4,5 @@
 run*.sh
 wandb/
 checkpoints/
+Aura-1B/
+runs/

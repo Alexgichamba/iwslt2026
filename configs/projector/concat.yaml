@@ -1,5 +1,0 @@
-# Concat (stack + MLP) projector — SLAM-LLM style, 5x downsampling
-name: concat
-kwargs:
-  downsample_factor: 5
-  hidden_dim: 2048

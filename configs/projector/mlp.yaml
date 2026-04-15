@@ -1,4 +1,0 @@
-# MLP projector — no time downsampling, 2-layer MLP
-name: mlp
-kwargs:
-  hidden_dim: 2048
