@@ -1,4 +1,4 @@
-# Small encoder for fast iteration / debugging
+# Conformer small — fast iteration / debugging
 input_dim: 80
 encoder_dim: 256
 num_heads: 4

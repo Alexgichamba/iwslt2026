@@ -1,36 +1,45 @@
-# IWSLT 2026 — End-to-End Low-Resource Speech Translation
+# IWSLT 2026 — End-to-End Speech Translation (Aura-1B)
 
-End-to-end speech translation system for the IWSLT 2026 low-resource track, targeting African languages (Bemba, Hausa, Igbo, Yoruba → English).
+End-to-end speech translation for the IWSLT 2026 low-resource track,
+targeting African languages (Bemba, Hausa, Igbo, Yoruba → English).
 
 ## Architecture
 
 ```
-Audio → Log-Mel → ConvSubsampler(4x) → Conformer Encoder → Projector → LLM → Translation
+Audio → Log-Mel → ConvSubsampler(4×) → Conformer Encoder
+                                              │
+                                    (CTCCompressor — optional)
+                                              │
+                                      Projector (MLP | Transformer)
+                                              │
+                                          Aura-1B
+                                              │
+                                        Transcript / Translation
 ```
 
 **Training stages:**
 
-1. **Stage 1 — CTC Pretraining**: Train the conformer speech encoder on ASR data with CTC loss.
-2. **Stage 2 — Projector Training**: Freeze encoder + LLM, train only the modality projector on ST data.
-3. **Stage 3 — LoRA Fine-tuning**: Freeze encoder, train projector + LoRA adapters on the LLM.
+| Stage | What trains | Config |
+|---|---|---|
+| 1 — CTC Pretraining | Conformer encoder | `configs/experiment/pretrain_ctc.yaml` |
+| 2 — Projector Alignment | Projector only | `configs/experiment/stage2.yaml` |
+| 3 — LoRA Fine-tuning | Projector + LoRA adapters | `configs/experiment/stage3.yaml` |
+| 4 — Full Fine-tuning | Encoder + Projector + Full LLM | `configs/experiment/stage4_full.yaml` |
+
+**CTC Compressor (optional):**
+Sits between encoder and projector. Uses the encoder's CTC predictions to
+merge consecutive frames predicted as the same token, removing blank frames
+and reducing sequence length before the LLM. Enabled with `ctc_compress.enabled: true`.
+
+**Auxiliary CTC loss:**
+When `ctc_weight > 0`, a weighted CTC loss on the encoder output is added to
+the CE loss. Keeps encoder representations phonetically grounded during ST training.
 
 ## Setup
 
 ```bash
 pip install -e ".[dev]"
 ```
-
-## Data Format
-
-Manifest files (CSV/TSV) with columns:
-
-| Column | Description |
-|---|---|
-| `audio_path` | Relative path to audio file |
-| `transcript` | Source language transcript (for CTC) |
-| `translation` | English translation (for ST) |
-| `language` | Source language code |
-| `duration` | Duration in seconds |
 
 ## Usage
 
@@ -41,22 +50,29 @@ bash scripts/pretrain_encoder.sh configs/experiment/pretrain_ctc.yaml
 
 ### Stage 2: Train projector
 ```bash
-bash scripts/train_st.sh configs/experiment/train_st_stage2.yaml
+bash scripts/train_stage2.sh configs/experiment/stage2.yaml
 ```
 
 ### Stage 3: Train projector + LoRA
 ```bash
-bash scripts/train_st.sh configs/experiment/train_st_stage3.yaml
+bash scripts/train_stage3.sh configs/experiment/stage3.yaml
+# Resume:
+bash scripts/train_stage3.sh configs/experiment/stage3.yaml runs/stage3/checkpoint_step10000
+```
+
+### Stage 4: Full fine-tune
+```bash
+bash scripts/train_stage4.sh configs/experiment/stage4_full.yaml
 ```
 
 ### Inference
 ```bash
-python -m st.inference.generate \
-    --config configs/experiment/train_st_stage3.yaml \
-    --encoder_ckpt checkpoints/encoder/encoder_final.pt \
-    --projector_ckpt checkpoints/st/st_epoch20.pt \
-    --lora_path checkpoints/st/lora_epoch20 \
-    --audio_paths test1.wav test2.wav
+bash scripts/infer.sh \
+    configs/experiment/stage3.yaml \
+    runs/stage3/checkpoint_step50000 \
+    audio.wav \
+    igbo \
+    transcribe
 ```
 
 ### Tests
@@ -64,36 +80,57 @@ python -m st.inference.generate \
 pytest tests/ -v
 ```
 
-## Config System
-
-Configs are plain YAML, composed into full experiment configs under `configs/experiment/`. Swap components by changing the experiment file:
-
-- **Encoder**: `configs/encoder/` — conformer_base, conformer_small
-- **Projector**: `configs/projector/` — linear, mlp, conv, stack
-- **LLM**: `configs/llm/` — afriquellm (with/without LoRA)
-- **Training**: `configs/training/` — pretrain_ctc, train_st
-
 ## Project Structure
 
 ```
 iwslt2026/
 ├── configs/
-│   ├── encoder/          # Conformer architecture configs
-│   ├── projector/        # Projector type configs
-│   ├── llm/              # LLM + LoRA configs
-│   ├── training/         # Hyperparameter configs
-│   └── experiment/       # Composed full-experiment configs
+│   ├── encoder/              # Conformer architecture configs
+│   └── experiment/           # Full experiment configs (one per stage)
+│
 ├── src/st/
 │   ├── models/
-│   │   ├── speech_encoder.py   # Conformer + CTC head
-│   │   ├── projector.py        # Linear / MLP / Conv / Stack projectors
-│   │   ├── llm_wrapper.py      # HuggingFace LM wrapper + LoRA
-│   │   └── speech_llm.py       # Full encoder→projector→LLM model
-│   ├── data/                   # Dataset, collators
-│   ├── training/               # Training scripts (CTC, ST)
-│   ├── inference/              # Generation / translation
-│   └── utils/                  # Audio features, metrics, config loading
-├── scripts/                    # Shell launch scripts
-├── tests/                      # Smoke tests
+│   │   ├── encoder.py        # SpeechEncoder (Conformer + CTC head)
+│   │   ├── projector.py      # MLPProjector, TransformerProjector
+│   │   ├── ctc_compressor.py # CTCCompressor (optional frame merging)
+│   │   ├── aura.py           # AuraLLM wrapper (load, freeze, LoRA)
+│   │   └── speech_aura.py    # SpeechAura: full model + forward + generate
+│   │
+│   ├── data/
+│   │   ├── dataset.py        # SpeechDataset (CSV index reader)
+│   │   ├── collator.py       # AuraCollator (builds Aura-format batches)
+│   │   ├── sampler.py        # DurationBucketSampler
+│   │   └── vocab.py          # CTC vocab build/save/load
+│   │
+│   ├── training/
+│   │   ├── pretrain_ctc.py   # Stage 1 training loop
+│   │   └── train_st.py       # Stage 2/3/4 training loop
+│   │
+│   ├── inference/
+│   │   └── generate.py       # CLI inference
+│   │
+│   └── utils/
+│       ├── audio.py          # build_feature_extractor
+│       ├── metrics.py        # WER, BLEU, chrF
+│       ├── schedulers.py     # CosineAnnealingWarmupRestarts
+│       └── config.py         # load_config, merge_configs
+│
+├── scripts/                  # Shell launch scripts
+├── tests/                    # pytest smoke tests
 └── pyproject.toml
 ```
+
+## Config System
+
+All experiment configs are plain YAML under `configs/experiment/`. Swap
+stages by pointing to a different config. Key sections:
+
+- **encoder**: Architecture + checkpoint path + vocab_size for CTC
+- **aura**: Checkpoint path + size
+- **projector**: `type: mlp | transformer` + transformer hyperparams
+- **ctc_compress**: `enabled`, `strategy`, `remove_blanks`
+- **data**: Index CSV paths + language filters + duration limits
+- **training**: LR, steps, freeze flags, LoRA rank, ctc_weight, W&B
+
+To disable CTC compression: set `ctc_compress: null` or `ctc_compress.enabled: false`.
+To disable auxiliary CTC loss: set `ctc_weight: 0.0` (also remove `vocab_size` from encoder).

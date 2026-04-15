@@ -1,5 +1,5 @@
-# Speech encoder (torchaudio Conformer)
-input_dim: 80          # mel bins
+# Conformer base — matches existing conformer_base.yaml
+input_dim: 80
 encoder_dim: 512
 num_heads: 8
 ffn_dim: 2048

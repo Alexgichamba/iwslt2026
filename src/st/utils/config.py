@@ -1,4 +1,4 @@
-"""YAML config loading with simple merging."""
+"""YAML config loading with deep merge."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
 
 
 def merge_configs(*configs: dict[str, Any]) -> dict[str, Any]:
-    """Deep-merge multiple config dicts. Later configs override earlier ones."""
+    """Deep-merge dicts. Later configs override earlier ones."""
     result: dict[str, Any] = {}
     for cfg in configs:
         _deep_merge(result, cfg)

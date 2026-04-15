@@ -1,0 +1,90 @@
+# Stage 3: Projector + LoRA fine-tuning
+# Freeze encoder + LLM base, train projector + LoRA adapters.
+
+encoder:
+  input_dim: 80
+  encoder_dim: 512
+  num_heads: 8
+  ffn_dim: 2048
+  num_layers: 12
+  depthwise_conv_kernel_size: 31
+  dropout: 0.1
+  checkpoint: checkpoints/encoder/encoder_final.pt
+  vocab_size: 512          # must match Stage 1 vocab — required for CTC compressor + aux loss
+
+aura:
+  checkpoint: Aura-1B/model.pt
+  tokenizer:  Aura-1B/tokenizer.json
+  size: 1b
+
+projector:
+  type: transformer        # mlp | transformer
+  num_layers: 2
+  num_heads: 8
+  dropout: 0.1
+
+ctc_compress:
+  enabled: true
+  strategy: avg            # avg | weighted | softmax
+  remove_blanks: true
+  blank_id: 0
+
+data:
+  train_index: /ocean/projects/cis250145p/shared/datasets/ASR_INDEX.csv
+  val_index:   /ocean/projects/cis250145p/shared/datasets/ASR_INDEX.csv
+  train_split: train
+  val_split:   dev
+  languages:
+    - igbo
+    - yoruba
+    - hausa
+    - bemba
+  max_duration: 20.0
+  lowercase: true
+  vocab_path: checkpoints/encoder/vocab.json
+
+training:
+  task: transcribe         # transcribe | translate
+  output_dir: runs/stage3
+
+  # Stage 3 freeze config
+  unfreeze_encoder: false
+  unfreeze_llm: false
+  lora_rank: 16
+  lora_alpha: 32
+  lora_targets: [q_proj, v_proj]
+
+  # Auxiliary CTC loss
+  ctc_weight: 0.3          # 0.0 = disabled
+
+  # Optimization
+  max_steps: 50000
+  lr: 2e-4
+  min_lr: 1e-6
+  warmup_steps: 1000
+  first_cycle_steps: 50000
+  gamma: 1.0
+  scheduler: cosine_warmup_restarts
+  weight_decay: 0.01
+  grad_accum: 8
+
+  # Batching
+  max_batch_duration: 120.0
+  max_batch_size: 64
+  max_seq_len: 1024
+  num_workers: 4
+
+  # Logging
+  log_every: 100
+  save_every: 5000
+  eval_every: 5000
+
+  # W&B
+  no_wandb: false
+  wandb_project: iwslt2026
+  wandb_run_name: stage3_transformer_proj_ctc_compress
+
+wandb:
+  enabled: true
+  project: iwslt2026
+  name: pretrain-ctc

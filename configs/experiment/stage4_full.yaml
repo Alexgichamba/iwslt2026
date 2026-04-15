@@ -1,0 +1,85 @@
+# Stage 4: Full fine-tuning (encoder + projector + full LLM).
+# Use a much lower LR than Stage 3 — all 1B+ params are trainable.
+# Typically run after Stage 3 to refine a strong checkpoint.
+
+encoder:
+  input_dim: 80
+  encoder_dim: 512
+  num_heads: 8
+  ffn_dim: 2048
+  num_layers: 12
+  depthwise_conv_kernel_size: 31
+  dropout: 0.1
+  checkpoint: checkpoints/encoder/encoder_final.pt
+  vocab_size: 512
+
+aura:
+  checkpoint: Aura-1B/model.pt
+  tokenizer:  Aura-1B/tokenizer.json
+  size: 1b
+
+projector:
+  type: transformer
+  num_layers: 2
+  num_heads: 8
+  dropout: 0.1
+
+ctc_compress:
+  enabled: true
+  strategy: avg
+  remove_blanks: true
+  blank_id: 0
+
+data:
+  train_index: /ocean/projects/cis250145p/shared/datasets/ASR_INDEX.csv
+  val_index:   /ocean/projects/cis250145p/shared/datasets/ASR_INDEX.csv
+  train_split: train
+  val_split:   dev
+  languages:
+    - igbo
+    - yoruba
+    - hausa
+    - bemba
+  max_duration: 20.0
+  lowercase: true
+  vocab_path: checkpoints/encoder/vocab.json
+
+training:
+  task: transcribe
+  output_dir: runs/stage4_full
+
+  # Stage 4: unfreeze everything, no LoRA
+  unfreeze_encoder: true
+  unfreeze_llm: true
+  lora_rank: 0
+
+  ctc_weight: 0.3
+
+  # Much lower LR for full fine-tune
+  max_steps: 20000
+  lr: 5e-5
+  min_lr: 1e-7
+  warmup_steps: 500
+  first_cycle_steps: 20000
+  gamma: 1.0
+  scheduler: cosine_warmup_restarts
+  weight_decay: 0.01
+  grad_accum: 16             # larger accumulation to compensate for smaller effective LR
+
+  max_batch_duration: 60.0   # smaller batches — full model is much heavier
+  max_batch_size: 16
+  max_seq_len: 1024
+  num_workers: 4
+
+  log_every: 50
+  save_every: 2000
+  eval_every: 2000
+
+  no_wandb: false
+  wandb_project: iwslt2026
+  wandb_run_name: stage4_full_finetune
+
+wandb:
+  enabled: true
+  project: iwslt2026
+  name: stage4-full
