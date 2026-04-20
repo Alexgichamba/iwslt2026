@@ -10,12 +10,12 @@ encoder:
   num_layers: 18
   depthwise_conv_kernel_size: 31
   dropout: 0.1
-  checkpoint: checkpoints/encoder_large/encoder_final.pt
+  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/encoder_large/encoder_final.pt
   vocab_size: 218           # match Stage 1 vocab size for CTC compressor
 
 aura:
-  checkpoint: Aura-1B/model.pt
-  tokenizer:  Aura-1B/tokenizer.json
+  checkpoint: /ocean/projects/cis250145p/tanghang/iwslt2026/tests/model.pt
+  tokenizer:  /ocean/projects/cis250145p/tanghang/iwslt2026/tests/tokenizer.json
   size: 1b
 
 projector:
@@ -42,39 +42,40 @@ data:
     - bemba
   max_duration: 20.0
   lowercase: true
-  vocab_path: checkpoints/encoder_large/vocab.json
+  vocab_path: /ocean/projects/cis250145p/shared/checkpoints/encoder_large/vocab.json
 
 training:
   task: transcribe
   output_dir: runs/stage2
 
-  unfreeze_encoder: true
+  unfreeze_encoder: false
   unfreeze_llm: false
   lora_rank: 0
 
-  ctc_weight: 0.3
+  ctc_weight: 0.0
 
   max_steps: 20000
-  lr: 2.0e-4
+  lr: 5.0e-5
   min_lr: 1.0e-6
   warmup_steps: 500
   first_cycle_steps: 10000
   gamma: 0.5
   scheduler: cosine_warmup_restarts
   weight_decay: 0.01
-  grad_accum: 8
+  grad_accum: 4
 
-  max_batch_duration: 240.0
+  max_batch_duration: 180.0
   max_batch_size: 96
   max_seq_len: 1024
-  num_workers: 4
+  num_workers: 12
 
   log_every: 100
   save_every: 2000
   eval_every: 2000
 
   no_wandb: false
-  wandb_project: iwslt2026
+  wandb_project: Aura_Multilingual_1b
+  wandb_entity: etanghan-carnegie-mellon-university
   wandb_run_name: stage2_projector_alignment
 
 wandb:

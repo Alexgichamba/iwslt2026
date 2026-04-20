@@ -93,7 +93,13 @@ class AuraCollator:
             ctc_lengths: list[int]           = []
             for i in keep:
                 text    = batch[i]["text"]
-                encoded = [self.vocab[c] for c in text if c in self.vocab]
+                encoded = []
+                for c in text:
+                    if c in self.vocab:
+                        encoded.append(self.vocab[c])
+                    elif " " in self.vocab:
+                        encoded.append(self.vocab[" "])
+                # if neither the character nor space exists, omit it to avoid crashing the embedder
                 ctc_list.append(torch.tensor(encoded, dtype=torch.long))
                 ctc_lengths.append(len(encoded))
 

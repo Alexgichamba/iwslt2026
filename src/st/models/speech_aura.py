@@ -199,13 +199,14 @@ class SpeechAura(nn.Module):
             audio_emb   = audio_embeds[i, :n_audio]         # (N, D)
             suffix_emb  = embed_layer(suffix_ids)            # (1, D)
             target_emb  = embed_layer(tgt.to(device))        # (L, D)
-            eos_emb     = embed_layer(eos_id)                # (1, D)
+            # eos_emb     = embed_layer(eos_id)                # (1, D)
 
-            seq_emb = torch.cat([prefix_emb, audio_emb, suffix_emb, target_emb, eos_emb], dim=0)
+            seq_emb = torch.cat([prefix_emb, audio_emb, suffix_emb, target_emb], dim=0)
             seqs.append(seq_emb)
 
             # --- build labels ---
-            prompt_len = 2 + n_audio + 1   # BOS + LANG + audio + TRANSCRIPT_START
+            # prompt_len = 2 + n_audio + 1   # BOS  + LANG  + audio             + TRANSCRIPT_START
+            prompt_len = 1 + n_audio + 1   #   LANG + audio + TRANSCRIPT_START  + 
             lab = torch.full((seq_emb.size(0),), -100, dtype=torch.long, device=device)
             lab[prompt_len : prompt_len + n_target] = tgt.to(device)
             lab[prompt_len + n_target] = self.aura.eos_id   # loss on EOS
@@ -230,7 +231,12 @@ class SpeechAura(nn.Module):
             for l in labels_list
         ])  # (B, S_max)
 
-        position_ids = torch.arange(S_max, device=device).unsqueeze(0).expand(B, -1)
+        position_ids = torch.zeros(B, S_max, dtype=torch.long, device=device)
+        for i, s in enumerate(seqs):
+            real_len = s.size(0)
+            position_ids[i, :real_len] = torch.arange(real_len, device=device)
+            if real_len < S_max:
+                position_ids[i, real_len:] = real_len - 1
 
         return inputs_embeds, labels, position_ids
 

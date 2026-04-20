@@ -1,17 +1,16 @@
-#!/usr/bin/env bash
-# Stage 2: Projector alignment (freeze encoder + LLM)
-# Usage: bash scripts/train_stage2.sh [--resume_from PATH]
+#!/bin/bash
+#SBATCH -p GPU-shared
+#SBATCH --gres=gpu:h100-80:1
+#SBATCH -t 48:00:00
+#SBATCH -A cis250145p
+#SBATCH -J Aura_Stage2_1GPU
+#SBATCH -o /ocean/projects/cis250145p/tanghang/iwslt2026/runs/stage2/checkpoint_step2000/logs/slurm-%j.out
+#SBATCH -e /ocean/projects/cis250145p/tanghang/iwslt2026/runs/stage2/checkpoint_step2000/logs/slurm-%j.err
 
-set -euo pipefail
+module load cuda/12.4.0
+PYTHON_ENV="/ocean/projects/cis250145p/tanghang/Aura_base/env/bin/python"
+cd /ocean/projects/cis250145p/tanghang/iwslt2026/src
 
-CONFIG=${1:-configs/experiment/stage2.yaml}
-RESUME=${2:-""}
-
-RESUME_FLAG=""
-if [ -n "$RESUME" ]; then
-    RESUME_FLAG="--resume_from $RESUME"
-fi
-
-python -m st.training.train_st \
-    --config "$CONFIG" \
-    $RESUME_FLAG
+PYTHONPATH=$(pwd) $PYTHON_ENV -m st.training.train_st \
+    --config /ocean/projects/cis250145p/tanghang/iwslt2026/configs/experiment/stage2.yaml
+    # --resume_from /ocean/projects/cis250145p/tanghang/iwslt2026/runs/stage2/checkpoint_step2000

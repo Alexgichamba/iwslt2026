@@ -191,7 +191,6 @@ class SpeechDataset(Dataset):
         # Log-mel spectrogram
         mel = self.mel_transform(waveform)               # (80, T)
         mel = torch.clamp(mel, min=1e-10).log10()
-        mel = (mel + 4.0) / 4.0                          # rough normalization
         mel = mel.T                                       # (T, 80)
 
         text = entry.get(self.text_column, "")

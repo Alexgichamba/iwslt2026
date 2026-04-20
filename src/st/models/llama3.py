@@ -467,8 +467,11 @@ class LlamaModel(nn.Module):
 
         self.norm = LLamaRMSNorm(params.dim, eps=params.norm_eps)
 
-    def forward( self , tokens: torch.Tensor, position_ids : torch.LongTensor, use_cache: bool = False, cache: KVcache = None):
-        h = self.embed_tokens(tokens)
+    def forward( self , tokens: torch.Tensor | None = None, position_ids : torch.LongTensor | None = None, use_cache: bool = False, cache: KVcache = None, inputs_embeds: torch.Tensor | None = None):
+        if inputs_embeds is not None:
+            h = inputs_embeds
+        else:
+            h = self.embed_tokens(tokens)
         
         def create_custom_forward(layer):
             def custom_forward(*args):
@@ -531,13 +534,19 @@ class LlamaTransformer(nn.Module):
     # @torch._dynamo.disable
     def forward(
         self, 
-        input_ids: torch.LongTensor,
+        input_ids: torch.LongTensor | None = None,
         targets: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = False,
         cache: Optional[KVcache] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
     ): 
         # Use CUDA graphs for repeated forward passes if possible
-        batch_size, seq_len = input_ids.shape
+        if inputs_embeds is not None:
+            batch_size, seq_len = inputs_embeds.shape[:2]
+            device = inputs_embeds.device
+        else:
+            batch_size, seq_len = input_ids.shape
+            device = input_ids.device
         static_input = (batch_size == 8 and seq_len == 2048 and not use_cache)  # Adjust based on your B and T
         
         if use_cache:
@@ -552,15 +561,16 @@ class LlamaTransformer(nn.Module):
 
 
             else: 
-                position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, seq_len)
+                position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, seq_len)
         else:
-            position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, seq_len)
+            position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, seq_len)
         
         outputs = self.model(
-            input_ids,
+            tokens=input_ids,
             position_ids = position_ids,
             use_cache=use_cache,
             cache=cache,
+            inputs_embeds=inputs_embeds,
         )  # [bs, seq_len, hidden_size]
         #43476 , 43477
 

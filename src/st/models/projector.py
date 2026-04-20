@@ -27,8 +27,6 @@ class MLPProjector(nn.Module):
         self.proj1 = nn.Linear(encoder_dim, llm_hidden)
         self.act = nn.GELU()
         self.proj2 = nn.Linear(llm_hidden, llm_hidden)
-        nn.init.zeros_(self.proj2.weight)
-        nn.init.zeros_(self.proj2.bias)
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
         """lengths unused — accepted for API compatibility with TransformerProjector."""
@@ -79,8 +77,8 @@ class TransformerProjector(nn.Module):
         )
 
         self.output_proj = nn.Linear(llm_hidden, llm_hidden)
-        nn.init.zeros_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
+        # nn.init.zeros_(self.output_proj.weight)
+        # nn.init.zeros_(self.output_proj.bias)
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
         """

@@ -1,5 +1,8 @@
 import torch
 from st.models.llama3 import ModelArgs
+
+
+# interact -p GPU-shared --gres=gpu 
 def load_model(model, path, load_dict_only=False):
     """Load a model from a checkpoint file."""
     checkpoint = torch.load(path, map_location=torch.device('cpu'))

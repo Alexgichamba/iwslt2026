@@ -4,11 +4,11 @@ Stage 1: Pretrain speech encoder with CTC loss.
 Step-based training with resume support. The saved checkpoint includes
 the full model state + optimizer + scheduler + vocab, so Stage 2/3
 can load it directly via load_encoder_from_checkpoint().
-
+PYTHONPATH=src /ocean/projects/cis250145p/tanghang/Aura_base/env/bin/python -m st.training.train_st --config configs/experiment/stage2.yaml --resume_from /ocean/projects/cis250145p/tanghang/iwslt2026/runs/stage2/checkpoint_step2000/projector.pt
 Usage:
     python -m st.training.pretrain_ctc --config configs/experiment/pretrain_ctc.yaml
     python -m st.training.pretrain_ctc --config configs/experiment/pretrain_ctc.yaml \
-        --resume_from checkpoints/encoder/encoder_step50000.pt
+        --resume_from checkpoints/encoder/encoder_step50000.pt /ocean/projects/cis250145p/tanghang/iwslt2026/runs/stage2/checkpoint_step2000/projector.pt
 """
 
 from __future__ import annotations

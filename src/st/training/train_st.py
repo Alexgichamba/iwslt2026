@@ -8,10 +8,13 @@ Stage 4: Train everything (encoder + projector + full LLM).
 Controlled entirely by the experiment YAML — no code changes needed to
 switch stages.
 
-Usage:
+interact -p GPU-shared --gres=gpu:v100-32:1 -t 8:00:00 -A cis250145p
+interact -p GPU-shared --gres=gpu:h100-80:1 -t 8:00:00 -A cis250145p
+
+PYTHONPATH=$(pwd) python -m st.training.train_st --config /ocean/projects/cis250145p/tanghang/iwslt2026/configs/experiment/stage2.yaml --resume_from /ocean/projects/cis250145p/tanghang/iwslt2026/runs/stage2/checkpoint_step2000
+
     python -m st.training.train_st --config configs/experiment/stage2.yaml
-    python -m st.training.train_st --config configs/experiment/stage3.yaml \
-        --resume_from runs/stage2/checkpoint_step10000
+    python -m st.training.train_st --config configs/experiment/stage3.yaml --resume_from /ocean/projects/cis250145p/tanghang/iwslt2026/runs/stage2/checkpoint_step2000/projector.pt
 """
 
 from __future__ import annotations
@@ -365,6 +368,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             import wandb
             wandb.init(
                 project=train_cfg.get("wandb_project", "iwslt2026"),
+                entity=train_cfg.get("wandb_entity"),
                 name=train_cfg.get("wandb_run_name", os.path.basename(output_dir)),
                 config=cfg,
                 resume="allow" if start_step > 0 else None,
@@ -385,6 +389,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
 
     running: dict[str, float] = {"loss": 0.0, "ce_loss": 0.0, "ctc_loss": 0.0}
     run_n = 0
+    micro_step = 0
 
     from tqdm import tqdm
     pbar = tqdm(total=max_steps - start_step, desc="Training", unit="step", dynamic_ncols=True)
@@ -429,31 +434,37 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                 import gc; gc.collect()
                 torch.cuda.empty_cache()
                 oom_cooldown = 3
+                # Roll back to last successful optimizer step to wipe out partial accumulation
+                micro_step = (micro_step // grad_accum) * grad_accum
+                running = {k: 0.0 for k in running}
+                run_n = 0
                 continue
 
             # Accumulate metrics (unscaled)
             for k in ("loss", "ce_loss", "ctc_loss"):
                 running[k] += out[k].item()
             run_n += 1
+            micro_step += 1
 
-            if (global_step + 1) % grad_accum == 0:
+            if micro_step % grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(trainable, 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
                 torch.cuda.empty_cache()
 
-            if scheduler is not None:
-                scheduler.step()
+                if scheduler is not None:
+                    scheduler.step()
+                
+                global_step += 1
+                pbar.update(1)
 
-            global_step += 1
-            pbar.update(1)
             pbar.set_postfix(
                 loss=f"{out['loss'].item():.3f}",
                 lr=f"{optimizer.param_groups[0]['lr']:.1e}",
                 bs=cur_bs, dur=f"{cur_dur:.0f}s", ep=epoch,
             )
 
-            if global_step % log_every == 0 and run_n > 0:
+            if global_step % log_every == 0 and run_n > 0 and micro_step % grad_accum == 0:
                 avg   = {k: v / run_n for k, v in running.items()}
                 cur_lr = optimizer.param_groups[0]["lr"]
                 log.info(
@@ -472,10 +483,10 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                 running = {k: 0.0 for k in running}
                 run_n = 0
 
-            if global_step % save_every == 0:
+            if global_step % save_every == 0 and micro_step % grad_accum == 0:
                 save_checkpoint(model, optimizer, scheduler, global_step, output_dir)
 
-            if val_loader and global_step % eval_every == 0:
+            if val_loader and global_step % eval_every == 0 and micro_step % grad_accum == 0:
                 torch.cuda.empty_cache()
                 metrics = evaluate(model, val_loader, device, task)
                 log.info(

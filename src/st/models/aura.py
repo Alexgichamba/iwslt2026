@@ -90,17 +90,22 @@ class AuraLLM(nn.Module):
         self.vocab_size: int  = cfg.vocab_size
         self.n_layers: int    = cfg.n_layers
 
-        # The checkpoint was saved with llama3/model_factory as top-level modules.
-        # Remap them to their new location (st.models.*) via a custom unpickler.
-        import io, pickle
-        from st.models import llama3 as _llama3_mod
-        from st.models import model_factory as _mf_mod
-        import sys as _sys
-        _sys.modules.setdefault("llama3", _llama3_mod)
-        _sys.modules.setdefault("model_factory", _mf_mod)
+        if ckpt_path.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            state = load_file(ckpt_path, device="cpu")
+        else:
+            # The checkpoint was saved with llama3/model_factory as top-level modules.
+            # Remap them to their new location (st.models.*) via a custom unpickler.
+            import io, pickle
+            from st.models import llama3 as _llama3_mod
+            from st.models import model_factory as _mf_mod
+            import sys as _sys
+            _sys.modules.setdefault("llama3", _llama3_mod)
+            _sys.modules.setdefault("model_factory", _mf_mod)
 
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        state = ckpt.get("model", ckpt)
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            state = ckpt.get("model", ckpt)
+
         state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
         self.model.load_state_dict(state)
         log.info(f"Loaded Aura-{size} from {ckpt_path}")
