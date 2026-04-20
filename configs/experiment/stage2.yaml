@@ -14,8 +14,8 @@ encoder:
   vocab_size: 218           # match Stage 1 vocab size for CTC compressor
 
 aura:
-  checkpoint: /ocean/projects/cis250145p/tanghang/iwslt2026/tests/model.pt
-  tokenizer:  /ocean/projects/cis250145p/tanghang/iwslt2026/tests/tokenizer.json
+  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/model.pt
+  tokenizer:  /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/tokenizer.json
   size: 1b
 
 projector:
@@ -47,6 +47,7 @@ data:
 training:
   task: transcribe
   output_dir: runs/stage2
+  val_samples_per_lang: 100
 
   unfreeze_encoder: false
   unfreeze_llm: false
@@ -64,7 +65,7 @@ training:
   weight_decay: 0.01
   grad_accum: 4
 
-  max_batch_duration: 180.0
+  max_batch_duration: 240.0
   max_batch_size: 96
   max_seq_len: 1024
   num_workers: 12
@@ -74,8 +75,7 @@ training:
   eval_every: 2000
 
   no_wandb: false
-  wandb_project: Aura_Multilingual_1b
-  wandb_entity: etanghan-carnegie-mellon-university
+  wandb_project: iwslt2026
   wandb_run_name: stage2_projector_alignment
 
 wandb:

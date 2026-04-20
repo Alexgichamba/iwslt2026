@@ -3,14 +3,14 @@
 
 encoder:
   input_dim: 80
-  encoder_dim: 512
-  num_heads: 8
-  ffn_dim: 2048
-  num_layers: 12
+  encoder_dim: 768
+  num_heads: 12
+  ffn_dim: 3072
+  num_layers: 18
   depthwise_conv_kernel_size: 31
   dropout: 0.1
-  checkpoint: checkpoints/encoder/encoder_final.pt
-  vocab_size: 512          # must match Stage 1 vocab — required for CTC compressor + aux loss
+  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/encoder_large/encoder_final.pt
+  vocab_size: 218           # match Stage 1 vocab size for CTC compressor
 
 aura:
   checkpoint: Aura-1B/model.pt

@@ -4,14 +4,14 @@
 
 encoder:
   input_dim: 80
-  encoder_dim: 512
-  num_heads: 8
-  ffn_dim: 2048
-  num_layers: 12
+  encoder_dim: 768
+  num_heads: 12
+  ffn_dim: 3072
+  num_layers: 18
   depthwise_conv_kernel_size: 31
   dropout: 0.1
-  checkpoint: checkpoints/encoder/encoder_final.pt
-  vocab_size: 512
+  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/encoder_large/encoder_final.pt
+  vocab_size: 218           # match Stage 1 vocab size for CTC compressor
 
 aura:
   checkpoint: Aura-1B/model.pt
@@ -42,34 +42,37 @@ data:
     - bemba
   max_duration: 20.0
   lowercase: true
-  vocab_path: checkpoints/encoder/vocab.json
+  vocab_path: /ocean/projects/cis250145p/shared/checkpoints/encoder_large/vocab.json
 
 training:
   task: transcribe
   output_dir: runs/stage4_full
 
-  # Stage 4: unfreeze everything, no LoRA
-  unfreeze_encoder: true
+  val_samples_per_lang: 100
+  # Weights from stage 2 — set these before launching stage 3
+  projector_checkpoint: 
+  # encoder_checkpoint:
+
+  unfreeze_encoder: false
   unfreeze_llm: true
   lora_rank: 0
 
-  ctc_weight: 0.3
+  ctc_weight: 0.0
 
-  # Much lower LR for full fine-tune
   max_steps: 20000
-  lr: 5e-5
-  min_lr: 1e-7
+  lr: 5.0e-5
+  min_lr: 1.0e-7
   warmup_steps: 500
-  first_cycle_steps: 20000
-  gamma: 1.0
+  first_cycle_steps: 10000
+  gamma: 0.5
   scheduler: cosine_warmup_restarts
   weight_decay: 0.01
-  grad_accum: 16             # larger accumulation to compensate for smaller effective LR
+  grad_accum: 4
 
-  max_batch_duration: 60.0   # smaller batches — full model is much heavier
-  max_batch_size: 16
+  max_batch_duration: 240.0
+  max_batch_size: 96
   max_seq_len: 1024
-  num_workers: 4
+  num_workers: 8
 
   log_every: 50
   save_every: 2000
