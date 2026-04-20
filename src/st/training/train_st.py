@@ -20,6 +20,8 @@ PYTHONPATH=$(pwd) python -m st.training.train_st --config /ocean/projects/cis250
 from __future__ import annotations
 
 import argparse
+import csv
+import gc
 import logging
 import os
 import time
@@ -167,6 +169,36 @@ def save_checkpoint(
 
 
 # ============================================================================
+# Val index selection
+# ============================================================================
+
+def build_val_generate_indices(
+    val_ds: SpeechDataset,
+    samples_per_lang: int = 100,
+) -> list[int]:
+    """Return the first `samples_per_lang` indices per language from val_ds.
+
+    Iterates entries in dataset order (no shuffling) so the result is
+    fully deterministic and stable across resumes.
+    """
+    from collections import defaultdict
+    lang_indices: dict[str, list[int]] = defaultdict(list)
+    for idx, entry in enumerate(val_ds.entries):
+        lang = entry.get("language") or entry.get("src_language") or "?"
+        if len(lang_indices[lang]) < samples_per_lang:
+            lang_indices[lang].append(idx)
+
+    indices: list[int] = []
+    for lang in sorted(lang_indices):
+        n = len(lang_indices[lang])
+        log.info(f"  Val generate: {n} samples for language '{lang}'")
+        indices.extend(lang_indices[lang])
+
+    log.info(f"Val generate indices: {len(indices)} total ({len(lang_indices)} languages)")
+    return indices
+
+
+# ============================================================================
 # Validation
 # ============================================================================
 
@@ -176,9 +208,13 @@ def evaluate(
     val_loader: DataLoader,
     device: torch.device,
     task: str,
-    max_batches: int = 50,
-    generate_samples: int = 20,
-) -> dict[str, float]:
+    val_generate_indices: list[int],
+    step: int = 0,
+    output_dir: str | None = None) -> dict[str, float]:
+
+    from collections import defaultdict
+    from tqdm import tqdm
+
     model.eval()
     total_loss, n = 0.0, 0
 
@@ -200,45 +236,102 @@ def evaluate(
             )
         total_loss += out["loss"].item()
         n += 1
-        if n >= max_batches:
-            break
 
     results: dict[str, float] = {"loss": total_loss / max(n, 1)}
     torch.cuda.empty_cache()
 
-    # Generation metrics
-    if generate_samples > 0:
-        preds, refs = [], []
-        val_ds = val_loader.dataset
-        for idx in range(min(generate_samples, len(val_ds))):
-            sample = val_ds[idx]
-            mel    = sample["mel"].unsqueeze(0).to(device)
-            mel_len = torch.tensor([sample["mel_len"]], device=device)
-            try:
-                pred = model.generate(
-                    mel, mel_len,
-                    target_lang=sample["language"],
-                    max_new_tokens=128,
+    # Generation over fixed val indices (first N per language)
+    val_ds = val_loader.dataset
+    preds: list[str] = []
+    refs:  list[str] = []
+    languages_seen: list[str] = []
+
+    for idx in tqdm(val_generate_indices, desc="Generating val", unit="sample", dynamic_ncols=True):
+        sample  = val_ds[idx]
+        mel     = sample["mel"].unsqueeze(0).to(device)
+        mel_len = torch.tensor([sample["mel_len"]], device=device)
+        try:
+            pred = model.generate(
+                mel, mel_len,
+                target_lang=sample["language"],
+                max_new_tokens=128,
+            )
+            preds.append(pred.strip())
+        except Exception as e:
+            log.warning(f"generate() failed for sample {idx}: {e}")
+            preds.append("")
+        refs.append(sample["text"].strip())
+        languages_seen.append(sample["language"])
+
+        del mel, mel_len
+        torch.cuda.empty_cache()
+
+    if preds:
+        # Group by language for per-language metrics
+        lang_preds: dict[str, list[str]] = defaultdict(list)
+        lang_refs:  dict[str, list[str]] = defaultdict(list)
+        for r, p, lang in zip(refs, preds, languages_seen):
+            lang_preds[lang].append(p)
+            lang_refs[lang].append(r)
+
+        if task == "transcribe":
+            from jiwer import wer as _sample_wer
+            per_sample_wer = []
+            for r, p in zip(refs, preds):
+                try:
+                    per_sample_wer.append(_sample_wer(r, p) if r.strip() else 0.0)
+                except Exception:
+                    per_sample_wer.append(1.0)
+
+            # Overall WER
+            results["wer"] = compute_wer(preds, refs)
+            # Per-language WER
+            for lang in sorted(lang_preds):
+                lang_wer = compute_wer(lang_preds[lang], lang_refs[lang])
+                results[f"wer_{lang}"] = lang_wer
+                log.info(f"  val WER [{lang}]: {lang_wer:.4f} ({len(lang_preds[lang])} samples)")
+        else:
+            per_sample_wer = None
+            # Overall BLEU / chrF
+            results["bleu"] = compute_bleu(preds, refs)["bleu"]
+            results["chrf"] = compute_chrf(preds, refs)["chrf"]
+            # Per-language BLEU / chrF
+            for lang in sorted(lang_preds):
+                lang_bleu = compute_bleu(lang_preds[lang], lang_refs[lang])["bleu"]
+                lang_chrf = compute_chrf(lang_preds[lang], lang_refs[lang])["chrf"]
+                results[f"bleu_{lang}"] = lang_bleu
+                results[f"chrf_{lang}"] = lang_chrf
+                log.info(
+                    f"  val [{lang}]: BLEU={lang_bleu:.2f} chrF={lang_chrf:.2f} "
+                    f"({len(lang_preds[lang])} samples)"
                 )
-                preds.append(pred.strip())
-                refs.append(sample["text"].strip())
-            except Exception as e:
-                log.warning(f"generate() failed for sample {idx}: {e}")
 
-            del mel, mel_len
-            torch.cuda.empty_cache()
+        # Log a few examples per language
+        logged: dict[str, int] = defaultdict(int)
+        for r, p, lang in zip(refs, preds, languages_seen):
+            if logged[lang] < 2:
+                log.info(f"  [val {lang}]  ref: {r[:80]}")
+                log.info(f"  [val {lang}]  hyp: {p[:80]}")
+                logged[lang] += 1
 
-        if preds:
-            if task == "transcribe":
-                results["wer"] = compute_wer(preds, refs)
-            else:
-                results["bleu"] = compute_bleu(preds, refs)["bleu"]
-                results["chrf"] = compute_chrf(preds, refs)["chrf"]
-            for i in range(min(3, len(preds))):
-                log.info(f"  [val {i}]  ref: {refs[i][:80]}")
-                log.info(f"  [val {i}]  hyp: {preds[i][:80]}")
+        # Write CSV
+        if output_dir is not None:
+            csv_path = os.path.join(output_dir, f"val_preds_step{step}.csv")
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if task == "transcribe":
+                    writer.writerow(["idx", "language", "reference", "hypothesis", "wer"])
+                    for i, (r, p, lang, w) in enumerate(
+                        zip(refs, preds, languages_seen, per_sample_wer)
+                    ):
+                        writer.writerow([i, lang, r, p, f"{w:.4f}"])
+                else:
+                    writer.writerow(["idx", "language", "reference", "hypothesis"])
+                    for i, (r, p, lang) in enumerate(zip(refs, preds, languages_seen)):
+                        writer.writerow([i, lang, r, p])
+            log.info(f"Val predictions saved → {csv_path} ({len(preds)} samples)")
 
-    import gc; gc.collect()
+    gc.collect()
     torch.cuda.empty_cache()
     model.train()
     return results
@@ -332,6 +425,12 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             collate_fn=collator,
             pin_memory=True,
         )
+
+    # Build fixed val generation indices once — first N per language, deterministic
+    val_generate_indices: list[int] = []
+    if val_ds is not None:
+        samples_per_lang = train_cfg.get("val_samples_per_lang", 100)
+        val_generate_indices = build_val_generate_indices(val_ds, samples_per_lang)
 
     # --- Optimizer ---
     trainable = [p for p in model.parameters() if p.requires_grad]
@@ -431,10 +530,9 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                 )
                 optimizer.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
-                import gc; gc.collect()
+                gc.collect()
                 torch.cuda.empty_cache()
                 oom_cooldown = 3
-                # Roll back to last successful optimizer step to wipe out partial accumulation
                 micro_step = (micro_step // grad_accum) * grad_accum
                 running = {k: 0.0 for k in running}
                 run_n = 0
@@ -454,7 +552,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
 
                 if scheduler is not None:
                     scheduler.step()
-                
+
                 global_step += 1
                 pbar.update(1)
 
@@ -488,7 +586,11 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
 
             if val_loader and global_step % eval_every == 0 and micro_step % grad_accum == 0:
                 torch.cuda.empty_cache()
-                metrics = evaluate(model, val_loader, device, task)
+                metrics = evaluate(
+                    model, val_loader, device, task,
+                    val_generate_indices=val_generate_indices,
+                    step=global_step, output_dir=output_dir,
+                )
                 log.info(
                     f"step {global_step} val | "
                     + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
@@ -504,7 +606,11 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
     save_checkpoint(model, optimizer, scheduler, global_step, output_dir)
 
     if val_loader:
-        metrics = evaluate(model, val_loader, device, task)
+        metrics = evaluate(
+            model, val_loader, device, task,
+            val_generate_indices=val_generate_indices,
+            step=global_step, output_dir=output_dir,
+        )
         log.info("Final val | " + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
         if use_wandb:
             import wandb
