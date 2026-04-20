@@ -13,8 +13,8 @@ encoder:
   vocab_size: 218           # match Stage 1 vocab size for CTC compressor
 
 aura:
-  checkpoint: Aura-1B/model.pt
-  tokenizer:  Aura-1B/tokenizer.json
+  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/model.pt
+  tokenizer:  /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/tokenizer.json
   size: 1b
 
 projector:

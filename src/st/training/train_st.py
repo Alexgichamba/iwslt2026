@@ -91,6 +91,20 @@ def build_model(cfg: dict) -> SpeechAura:
         freeze_llm=freeze_llm,
     )
 
+    # Load projector checkpoint if specified
+    proj_ckpt = train_cfg.get("projector_checkpoint")
+    if proj_ckpt:
+        proj_path = f"{proj_ckpt}/projector.pt"
+        state = torch.load(proj_path, map_location="cpu", weights_only=True)
+        missing, unexpected = model.projector.load_state_dict(state, strict=True)
+        if missing:
+            log.warning(f"Projector checkpoint missing keys: {missing}")
+        if unexpected:
+            log.warning(f"Projector checkpoint unexpected keys: {unexpected}")
+        log.info(f"Projector loaded ← {proj_path}")
+    else:
+        log.info("Projector: no checkpoint specified, training from scratch")
+
     return model
 
 
