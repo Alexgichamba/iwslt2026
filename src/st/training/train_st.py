@@ -11,10 +11,9 @@ switch stages.
 interact -p GPU-shared --gres=gpu:v100-32:1 -t 8:00:00 -A cis250145p
 interact -p GPU-shared --gres=gpu:h100-80:1 -t 8:00:00 -A cis250145p
 
-PYTHONPATH=$(pwd) python -m st.training.train_st --config /ocean/projects/cis250145p/tanghang/iwslt2026/configs/experiment/stage2.yaml --resume_from /ocean/projects/cis250145p/tanghang/iwslt2026/runs/stage2/checkpoint_step2000
+PYTHONPATH=$(pwd) python -m st.training.train_st --config configs/experiment/stage{x}.yaml --resume_from runs/stage{x}/checkpoint_step{x}000/
 
     python -m st.training.train_st --config configs/experiment/stage2.yaml
-    python -m st.training.train_st --config configs/experiment/stage3.yaml --resume_from /ocean/projects/cis250145p/tanghang/iwslt2026/runs/stage2/checkpoint_step2000/projector.pt
 """
 
 from __future__ import annotations

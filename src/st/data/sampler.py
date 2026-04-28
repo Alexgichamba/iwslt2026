@@ -109,15 +109,17 @@ class DurationBucketSampler(Sampler):
     # ------------------------------------------------------------------
 
     def __iter__(self) -> Iterator[list[int]]:
-        batches = [b.copy() for b in self._all_batches]
-
+        # Shuffle within each bucket, then rebuild batches fresh each epoch
+        buckets = [b.copy() for b in self._buckets]
+        if self.shuffle:
+            for b in buckets:
+                random.shuffle(b)
+        
+        batches = self._make_batches(buckets)
+        
         if self.shuffle_buckets:
             random.shuffle(batches)
-
-        if self.shuffle:
-            for b in batches:
-                random.shuffle(b)
-
+        
         yield from batches
 
     def __len__(self) -> int:
