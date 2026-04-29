@@ -56,21 +56,29 @@ class SpeechDataset(Dataset):
         self,
         index_path: str | Path,
         split: str | None = "train",
+        task: str = "asr",
         languages: list[str] | None = None,
+        src_languages: list[str] | None = None,
+        tgt_languages: list[str] | None = None,
         sources: list[str] | None = None,
-        text_column: str = "transcript",
         max_duration: float = 30.0,
         min_duration: float = 0.1,
         sample_rate: int = _DEFAULT_SR,
         lowercase: bool = False,
     ):
-        self.text_column = text_column
+        if task not in ("asr", "cot"):
+            raise ValueError(f"task must be 'asr' or 'cot', got '{task}'")
+
+        self.task = task
         self.sample_rate = sample_rate
         self.lowercase   = lowercase
         self.max_frames  = int(max_duration * sample_rate)
 
+        effective_src = src_languages if src_languages is not None else languages
+
         self.entries: list[dict[str, str]] = self._load_index(
-            index_path, split, languages, sources, min_duration, max_duration
+            index_path, split, task, effective_src, tgt_languages,
+            sources, min_duration, max_duration,
         )
 
         # Pre-extract durations for DurationBucketSampler (avoids probing files at runtime)
@@ -105,15 +113,20 @@ class SpeechDataset(Dataset):
     def _load_index(
         path: str | Path,
         split: str | None,
-        languages: list[str] | None,
+        task: str,
+        src_languages: list[str] | None,
+        tgt_languages: list[str] | None,
         sources: list[str] | None,
         min_duration: float,
         max_duration: float,
     ) -> list[dict[str, str]]:
-        lang_set   = set(languages) if languages else None
+        src_set    = set(src_languages) if src_languages else None
+        tgt_set    = set(tgt_languages) if tgt_languages else None
         source_set = set(sources) if sources else None
-        entries    = []
-        skipped    = 0
+
+        entries = []
+        skipped_no_dur = 0
+        skipped_no_translation = 0
 
         with open(path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -121,7 +134,7 @@ class SpeechDataset(Dataset):
                 # Duration filter
                 dur_str = row.get("duration", "").strip()
                 if not dur_str:
-                    skipped += 1
+                    skipped_no_dur += 1
                     continue
                 dur = float(dur_str)
                 if dur < min_duration or dur > max_duration:
@@ -131,21 +144,38 @@ class SpeechDataset(Dataset):
                 if split is not None and row.get("split", "") != split:
                     continue
 
-                # Language filter
-                if lang_set is not None:
-                    lang = row.get("language") or row.get("src_language") or ""
-                    if lang not in lang_set:
+                # Source-language filter
+                if src_set is not None:
+                    src_lang = row.get("language") or row.get("src_language") or ""
+                    if src_lang not in src_set:
+                        continue
+
+                # Target-language filter (CoT only — ASR has no tgt_language column)
+                if tgt_set is not None and task == "cot":
+                    if row.get("tgt_language", "") not in tgt_set:
                         continue
 
                 # Source filter
                 if source_set is not None and row.get("source", "") not in source_set:
                     continue
 
+                # CoT requires both transcript and translation populated
+                if task == "cot":
+                    transcript  = row.get("transcript",  "").strip()
+                    translation = row.get("translation", "").strip()
+                    if not transcript or not translation:
+                        skipped_no_translation += 1
+                        continue
+
                 entries.append(row)
 
-        if skipped:
-            log.warning(f"Skipped {skipped} rows with missing duration in {path}")
-
+        if skipped_no_dur:
+            log.warning(f"Skipped {skipped_no_dur} rows with missing duration in {path}")
+        if skipped_no_translation:
+            log.warning(
+                f"Skipped {skipped_no_translation} rows missing transcript/translation "
+                f"(required for task=cot)"
+            )
         return entries
 
     # ------------------------------------------------------------------
@@ -193,17 +223,30 @@ class SpeechDataset(Dataset):
         mel = torch.clamp(mel, min=1e-10).log10()
         mel = mel.T                                       # (T, 80)
 
-        text = entry.get(self.text_column, "")
-        if self.lowercase:
-            text = text.lower()
+        # Source language (always present in both ASR and AST CSVs)
+        src_language = entry.get("language") or entry.get("src_language") or ""
 
-        language = entry.get("language") or entry.get("src_language") or ""
+        transcript = entry.get("transcript", "")
+        if self.lowercase:
+            transcript = transcript.lower()
+
+        if self.task == "asr":
+            translation  = ""
+            tgt_language = src_language
+        else:  # cot
+            translation = entry.get("translation", "")
+            if self.lowercase:
+                translation = translation.lower()
+            tgt_language = entry.get("tgt_language", "english")
 
         return {
-            "audio_id":  entry.get("audio_id", ""),
-            "mel":       mel,
-            "mel_len":   mel.size(0),
-            "text":      text,
-            "language":  language,
-            "source":    entry.get("source", ""),
+            "audio_id":     entry.get("audio_id", ""),
+            "mel":          mel,
+            "mel_len":      mel.size(0),
+            "transcript":   transcript,
+            "translation":  translation,
+            "src_language": src_language,
+            "tgt_language": tgt_language,
+            "task":         self.task,
+            "source":       entry.get("source", ""),
         }

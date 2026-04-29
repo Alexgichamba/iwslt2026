@@ -179,53 +179,43 @@ class TestAuraCollator:
     def mock_tokenizer(self):
         class _Tok:
             def encode(self, text, add_special_tokens=False):
-                return [ord(c) % 100 + 10 for c in text[:10]]
+                return [ord(c) % 100 + 20 for c in text[:10]]
         return _Tok()
 
     @pytest.fixture
     def collator(self, mock_tokenizer):
-        return AuraCollator(
-            tokenizer=mock_tokenizer,
-            max_target_tokens=512,
-        )
+        return AuraCollator(tokenizer=mock_tokenizer, max_target_tokens=512)
 
-    @pytest.fixture
-    def batch(self):
-        return [
-            {"mel": torch.randn(40, 80), "mel_len": 40,
-             "text": "hello", "language": "igbo", "audio_id": "a1", "source": "x"},
-            {"mel": torch.randn(30, 80), "mel_len": 30,
-             "text": "world", "language": "hausa", "audio_id": "a2", "source": "x"},
-        ]
-
-    def test_output_keys(self, collator, batch):
-        out = collator(batch)
-        assert out is not None
-        for key in ("audio_features", "audio_lengths", "target_ids",
-                    "target_lengths", "language"):
-            assert key in out
-
-    def test_batch_size(self, collator, batch):
-        out = collator(batch)
-        assert out["audio_features"].size(0) == 2
-        assert len(out["language"]) == 2
-
-    def test_labels_masked(self, collator, batch):
-        # collator no longer produces labels — that's done in model forward
-        out = collator(batch)
-        assert "labels" not in out
-        assert out["target_ids"].shape[0] == 2
-
-    def test_all_too_long_returns_none(self, mock_tokenizer):
-        collator = AuraCollator(
-            tokenizer=mock_tokenizer,
-            max_target_tokens=1,   # impossibly short
-        )
+    def test_asr_batch(self, collator):
         batch = [
             {"mel": torch.randn(40, 80), "mel_len": 40,
-             "text": "hi there", "language": "igbo", "audio_id": "a1", "source": "x"},
+             "transcript": "hello", "translation": "",
+             "src_language": "igbo", "tgt_language": "igbo",
+             "task": "asr", "audio_id": "a1", "source": "x"},
+            {"mel": torch.randn(30, 80), "mel_len": 30,
+             "transcript": "world", "translation": "",
+             "src_language": "hausa", "tgt_language": "hausa",
+             "task": "asr", "audio_id": "a2", "source": "x"},
         ]
-        assert collator(batch) is None
+        out = collator(batch)
+        assert out is not None
+        assert out["audio_features"].size(0) == 2
+        assert out["transcript_lengths"].tolist() == [5, 5]
+        assert out["translation_lengths"].tolist() == [0, 0]
+        assert out["task"] == ["asr", "asr"]
+
+    def test_cot_batch(self, collator):
+        batch = [
+            {"mel": torch.randn(40, 80), "mel_len": 40,
+             "transcript": "hello", "translation": "world peace",
+             "src_language": "igbo", "tgt_language": "english",
+             "task": "cot", "audio_id": "a1", "source": "x"},
+        ]
+        out = collator(batch)
+        assert out is not None
+        assert out["transcript_lengths"].tolist() == [5]
+        assert out["translation_lengths"][0].item() > 0
+        assert out["task"] == ["cot"]
 
 
 # ============================================================================
@@ -262,3 +252,87 @@ class TestDurationBucketSampler:
             total = sum(fake_dataset.durations[i] for i in batch)
             # Allow one sample to push slightly over (first sample in empty batch)
             assert total <= target + max(fake_dataset.durations)
+
+class _MockAura:
+    def __init__(self, hidden_size=128):
+        import torch.nn as nn
+        self.hidden_size = hidden_size
+        self.bos_id = 0
+        self.eos_id = 1
+        self.transcript_start_id = 12
+        self.translate_start_id = 15
+        self.task_asr_id = 13
+        self.task_cot_id = 14
+        self._embed = nn.Embedding(300, hidden_size)
+        self._lora_layers = None
+
+    def get_embed_layer(self):
+        return self._embed
+
+
+class _MockSpeechAura:
+    def __init__(self):
+        from st.models.speech_aura import SpeechAura
+        self._build_inputs = SpeechAura._build_inputs.__get__(self, _MockSpeechAura)
+        self.aura = _MockAura()
+
+
+class TestSequenceAssembly:
+    """Hard assertions on label positions — catches teacher-forcing bugs as regressions."""
+
+    def test_asr_label_alignment(self):
+        model = _MockSpeechAura()
+        N, L_t, D = 5, 4, 128
+        embeds, labels, _ = model._build_inputs(
+            torch.randn(1, N, D), torch.tensor([N]),
+            torch.tensor([[100, 101, 102, 103]]), torch.tensor([L_t]),
+            torch.zeros(1, 1, dtype=torch.long), torch.tensor([0]),
+            tgt_languages=["igbo"], tasks=["asr"],
+            device=torch.device("cpu"),
+        )
+        # length = 3 + N + 1 + L_t = 13; prompt_len = 8
+        assert labels.shape == (1, 13)
+        expected = torch.full((13,), -100, dtype=torch.long)
+        expected[8:12] = torch.tensor([100, 101, 102, 103])
+        expected[12] = 1  # eos
+        assert torch.equal(labels[0], expected)
+
+    def test_cot_label_alignment(self):
+        model = _MockSpeechAura()
+        N, L_t, L_r, D = 5, 3, 2, 128
+        embeds, labels, _ = model._build_inputs(
+            torch.randn(1, N, D), torch.tensor([N]),
+            torch.tensor([[100, 101, 102]]), torch.tensor([L_t]),
+            torch.tensor([[200, 201]]), torch.tensor([L_r]),
+            tgt_languages=["english"], tasks=["cot"],
+            device=torch.device("cpu"),
+        )
+        # length = 3 + N + 1 + L_t + 1 + L_r = 15; prompt_len = 8
+        assert labels.shape == (1, 15)
+        expected = torch.full((15,), -100, dtype=torch.long)
+        expected[8:11]  = torch.tensor([100, 101, 102])  # transcript
+        expected[11]    = 15                               # TRANSLATE_START
+        expected[12:14] = torch.tensor([200, 201])         # translation
+        expected[14]    = 1                                # eos
+        assert torch.equal(labels[0], expected)
+
+    def test_cot_predicting_positions(self):
+        """Embedding at position prompt_len+L_t (which is supervised against TLS)
+        must be the last transcript token's embedding."""
+        model = _MockSpeechAura()
+        N, L_t, L_r, D = 5, 3, 2, 128
+        embeds, labels, _ = model._build_inputs(
+            torch.randn(1, N, D), torch.tensor([N]),
+            torch.tensor([[100, 101, 102]]), torch.tensor([L_t]),
+            torch.tensor([[200, 201]]), torch.tensor([L_r]),
+            tgt_languages=["english"], tasks=["cot"],
+            device=torch.device("cpu"),
+        )
+        # Position 11: embedding should be t3=102, label should be TLS=15
+        t3_emb = model.aura._embed(torch.tensor([102])).squeeze(0)
+        assert torch.allclose(embeds[0, 11], t3_emb)
+        assert labels[0, 11].item() == 15
+        # Position 12: embedding should be TLS, label should be r1=200
+        tls_emb = model.aura._embed(torch.tensor([15])).squeeze(0)
+        assert torch.allclose(embeds[0, 12], tls_emb)
+        assert labels[0, 12].item() == 200

@@ -223,8 +223,10 @@ def evaluate(
     task: str,
     val_generate_indices: list[int],
     step: int = 0,
-    output_dir: str | None = None) -> dict[str, float]:
-
+    output_dir: str | None = None,
+) -> dict[str, float]:
+    """Run validation. WER on transcript portion always; for CoT also BLEU/chrF
+    on translation portion."""
     from collections import defaultdict
     from tqdm import tqdm
 
@@ -238,93 +240,107 @@ def evaluate(
                  for k, v in batch.items()}
         with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                 enabled=(device.type == "cuda")):
-            out = model(
-                audio_features=batch["audio_features"],
-                audio_lengths=batch["audio_lengths"],
-                target_ids=batch["target_ids"],
-                target_lengths=batch["target_lengths"],
-                languages=batch["language"],
-                ctc_labels=batch.get("ctc_labels"),
-                ctc_label_lengths=batch.get("ctc_label_lengths"),
-            )
+            out = model(**batch)
         total_loss += out["loss"].item()
         n += 1
 
     results: dict[str, float] = {"loss": total_loss / max(n, 1)}
     torch.cuda.empty_cache()
 
-    # Generation over fixed val indices (first N per language)
     val_ds = val_loader.dataset
-    preds: list[str] = []
-    refs:  list[str] = []
-    languages_seen: list[str] = []
+    src_langs_seen: list[str] = []
+    hyp_transcripts:  list[str] = []
+    ref_transcripts:  list[str] = []
+    hyp_translations: list[str] = []
+    ref_translations: list[str] = []
 
     for idx in tqdm(val_generate_indices, desc="Generating val", unit="sample", dynamic_ncols=True):
         sample  = val_ds[idx]
         mel     = sample["mel"].unsqueeze(0).to(device)
         mel_len = torch.tensor([sample["mel_len"]], device=device)
         try:
-            pred = model.generate(
+            output = model.generate(
                 mel, mel_len,
-                target_lang=sample["language"],
-                max_new_tokens=128,
+                target_lang=sample["tgt_language"],
+                task=task,
+                max_new_tokens=256 if task == "cot" else 128,
             )
-            preds.append(pred.strip())
+            if task == "asr":
+                hyp_t = model._strip_special_tokens(output).strip()
+                hyp_r = ""
+            else:
+                hyp_t, hyp_r = model.split_cot_output(output)
+            hyp_transcripts.append(hyp_t)
+            hyp_translations.append(hyp_r)
         except Exception as e:
             log.warning(f"generate() failed for sample {idx}: {e}")
-            preds.append("")
-        refs.append(sample["text"].strip())
-        languages_seen.append(sample["language"])
+            hyp_transcripts.append("")
+            hyp_translations.append("")
+
+        ref_transcripts.append(sample["transcript"].strip())
+        ref_translations.append(sample.get("translation", "").strip())
+        src_langs_seen.append(sample["src_language"])
 
         del mel, mel_len
         torch.cuda.empty_cache()
 
-    if preds:
-        # Group by language for per-language metrics
-        lang_preds: dict[str, list[str]] = defaultdict(list)
-        lang_refs:  dict[str, list[str]] = defaultdict(list)
-        for r, p, lang in zip(refs, preds, languages_seen):
-            lang_preds[lang].append(p)
-            lang_refs[lang].append(r)
+    if hyp_transcripts:
+        lang_hyp_t: dict[str, list[str]] = defaultdict(list)
+        lang_ref_t: dict[str, list[str]] = defaultdict(list)
+        lang_hyp_r: dict[str, list[str]] = defaultdict(list)
+        lang_ref_r: dict[str, list[str]] = defaultdict(list)
+        for h_t, r_t, h_r, r_r, lang in zip(
+            hyp_transcripts, ref_transcripts,
+            hyp_translations, ref_translations,
+            src_langs_seen,
+        ):
+            lang_hyp_t[lang].append(h_t)
+            lang_ref_t[lang].append(r_t)
+            lang_hyp_r[lang].append(h_r)
+            lang_ref_r[lang].append(r_r)
 
-        if task == "transcribe":
-            from jiwer import wer as _sample_wer
-            per_sample_wer = []
-            for r, p in zip(refs, preds):
-                try:
-                    per_sample_wer.append(_sample_wer(r, p) if r.strip() else 0.0)
-                except Exception:
-                    per_sample_wer.append(1.0)
+        # Transcript metrics (always)
+        from jiwer import wer as _sample_wer
+        per_sample_wer = []
+        for r, p in zip(ref_transcripts, hyp_transcripts):
+            try:
+                per_sample_wer.append(_sample_wer(r, p) if r.strip() else 0.0)
+            except Exception:
+                per_sample_wer.append(1.0)
 
-            # Overall WER
-            results["wer"] = compute_wer(preds, refs)
-            # Per-language WER
-            for lang in sorted(lang_preds):
-                lang_wer = compute_wer(lang_preds[lang], lang_refs[lang])
-                results[f"wer_{lang}"] = lang_wer
-                log.info(f"  val WER [{lang}]: {lang_wer:.4f} ({len(lang_preds[lang])} samples)")
-        else:
-            per_sample_wer = None
-            # Overall BLEU / chrF
-            results["bleu"] = compute_bleu(preds, refs)["bleu"]
-            results["chrf"] = compute_chrf(preds, refs)["chrf"]
-            # Per-language BLEU / chrF
-            for lang in sorted(lang_preds):
-                lang_bleu = compute_bleu(lang_preds[lang], lang_refs[lang])["bleu"]
-                lang_chrf = compute_chrf(lang_preds[lang], lang_refs[lang])["chrf"]
+        results["wer"] = compute_wer(hyp_transcripts, ref_transcripts)
+        for lang in sorted(lang_hyp_t):
+            lang_wer = compute_wer(lang_hyp_t[lang], lang_ref_t[lang])
+            results[f"wer_{lang}"] = lang_wer
+            log.info(f"  val WER [{lang}]: {lang_wer:.4f} ({len(lang_hyp_t[lang])} samples)")
+
+        # Translation metrics (CoT only)
+        if task == "cot":
+            results["bleu"] = compute_bleu(hyp_translations, ref_translations)["bleu"]
+            results["chrf"] = compute_chrf(hyp_translations, ref_translations)["chrf"]
+            for lang in sorted(lang_hyp_r):
+                lang_bleu = compute_bleu(lang_hyp_r[lang], lang_ref_r[lang])["bleu"]
+                lang_chrf = compute_chrf(lang_hyp_r[lang], lang_ref_r[lang])["chrf"]
                 results[f"bleu_{lang}"] = lang_bleu
                 results[f"chrf_{lang}"] = lang_chrf
                 log.info(
                     f"  val [{lang}]: BLEU={lang_bleu:.2f} chrF={lang_chrf:.2f} "
-                    f"({len(lang_preds[lang])} samples)"
+                    f"({len(lang_hyp_r[lang])} samples)"
                 )
 
         # Log a few examples per language
         logged: dict[str, int] = defaultdict(int)
-        for r, p, lang in zip(refs, preds, languages_seen):
+        for h_t, r_t, h_r, r_r, lang in zip(
+            hyp_transcripts, ref_transcripts,
+            hyp_translations, ref_translations,
+            src_langs_seen,
+        ):
             if logged[lang] < 2:
-                log.info(f"  [val {lang}]  ref: {r[:80]}")
-                log.info(f"  [val {lang}]  hyp: {p[:80]}")
+                log.info(f"  [val {lang}] ref_t: {r_t[:80]}")
+                log.info(f"  [val {lang}] hyp_t: {h_t[:80]}")
+                if task == "cot":
+                    log.info(f"  [val {lang}] ref_r: {r_r[:80]}")
+                    log.info(f"  [val {lang}] hyp_r: {h_r[:80]}")
                 logged[lang] += 1
 
         # Write CSV
@@ -332,17 +348,25 @@ def evaluate(
             csv_path = os.path.join(output_dir, f"val_preds_step{step}.csv")
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                if task == "transcribe":
-                    writer.writerow(["idx", "language", "reference", "hypothesis", "wer"])
-                    for i, (r, p, lang, w) in enumerate(
-                        zip(refs, preds, languages_seen, per_sample_wer)
-                    ):
-                        writer.writerow([i, lang, r, p, f"{w:.4f}"])
+                if task == "asr":
+                    writer.writerow(["idx", "src_lang", "ref_transcript",
+                                     "hyp_transcript", "wer"])
+                    for i, (lang, r, h, w) in enumerate(zip(
+                        src_langs_seen, ref_transcripts, hyp_transcripts, per_sample_wer,
+                    )):
+                        writer.writerow([i, lang, r, h, f"{w:.4f}"])
                 else:
-                    writer.writerow(["idx", "language", "reference", "hypothesis"])
-                    for i, (r, p, lang) in enumerate(zip(refs, preds, languages_seen)):
-                        writer.writerow([i, lang, r, p])
-            log.info(f"Val predictions saved → {csv_path} ({len(preds)} samples)")
+                    writer.writerow([
+                        "idx", "src_lang",
+                        "ref_transcript", "hyp_transcript", "wer",
+                        "ref_translation", "hyp_translation",
+                    ])
+                    for i, (lang, r_t, h_t, w, r_r, h_r) in enumerate(zip(
+                        src_langs_seen, ref_transcripts, hyp_transcripts, per_sample_wer,
+                        ref_translations, hyp_translations,
+                    )):
+                        writer.writerow([i, lang, r_t, h_t, f"{w:.4f}", r_r, h_r])
+            log.info(f"Val predictions saved → {csv_path} ({len(hyp_transcripts)} samples)")
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -367,19 +391,25 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
     output_dir = train_cfg.get("output_dir", "runs/speech_aura")
     os.makedirs(output_dir, exist_ok=True)
 
+    task = data_cfg.get("task") or train_cfg.get("task", "asr")
+    if task not in ("asr", "cot"):
+        raise ValueError(f"data.task must be 'asr' or 'cot', got '{task}'")
+    log.info(f"Training task: {task}")
+
     # --- Model ---
     model = build_model(cfg).to(device)
 
-    # --- Data ---
-    languages = data_cfg.get("languages")
-    task      = train_cfg.get("task", "transcribe")
-
     lowercase = data_cfg.get("lowercase", False)
+
+    src_languages = data_cfg.get("src_languages") or data_cfg.get("languages")
+    tgt_languages = data_cfg.get("tgt_languages")
 
     train_ds = SpeechDataset(
         index_path=data_cfg["train_index"],
         split=data_cfg.get("train_split", "train"),
-        languages=languages,
+        task=task,
+        src_languages=src_languages,
+        tgt_languages=tgt_languages,
         max_duration=data_cfg.get("max_duration", 20.0),
         lowercase=lowercase,
     )
@@ -388,7 +418,9 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         val_ds = SpeechDataset(
             index_path=data_cfg["val_index"],
             split=data_cfg.get("val_split", "dev"),
-            languages=languages,
+            task=task,
+            src_languages=src_languages,
+            tgt_languages=tgt_languages,
             max_duration=data_cfg.get("max_duration", 20.0),
             lowercase=lowercase,
         )
@@ -522,17 +554,8 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             cur_dur = batch["audio_lengths"].sum().item() * 0.01  # frames × 10ms
 
             try:
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16,
-                                        enabled=(device.type == "cuda")):
-                    out = model(
-                        audio_features=batch["audio_features"],
-                        audio_lengths=batch["audio_lengths"],
-                        target_ids=batch["target_ids"],
-                        target_lengths=batch["target_lengths"],
-                        languages=batch["language"],
-                        ctc_labels=batch.get("ctc_labels"),
-                        ctc_label_lengths=batch.get("ctc_label_lengths"),
-                    )
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                    out = model(**batch)
                     loss = out["loss"] / grad_accum
 
                 loss.backward()

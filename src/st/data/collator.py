@@ -39,26 +39,27 @@ class AuraCollator:
     max_target_tokens: int = 256
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any] | None:
-        """
-        Args:
-            batch: List of dicts from SpeechDataset.__getitem__().
-
-        Returns:
-            Dict with tensors + language list, or None if all samples dropped.
-        """
-        # 1. Tokenize targets, drop samples that are too long
+        # 1. Tokenize transcript (always) and translation (CoT only).
         keep: list[int] = []
-        target_ids_list: list[torch.Tensor] = []
+        transcript_ids_list: list[torch.Tensor] = []
+        translation_ids_list: list[torch.Tensor] = []
 
         for i, b in enumerate(batch):
-            ids = self.tokenizer.encode(b["text"], add_special_tokens=False)
-            if len(ids) > self.max_target_tokens:
+            t_ids = self.tokenizer.encode(b["transcript"], add_special_tokens=False)
+            if b["task"] == "cot":
+                tr_ids = self.tokenizer.encode(b["translation"], add_special_tokens=False)
+            else:
+                tr_ids = []
+
+            if len(t_ids) + len(tr_ids) > self.max_target_tokens:
                 log.debug(
                     f"Dropping sample {b.get('audio_id', i)}: "
-                    f"target {len(ids)} tokens > max_target_tokens={self.max_target_tokens}"
+                    f"target {len(t_ids) + len(tr_ids)} > max_target_tokens"
                 )
                 continue
-            target_ids_list.append(torch.tensor(ids, dtype=torch.long))
+
+            transcript_ids_list.append(torch.tensor(t_ids, dtype=torch.long))
+            translation_ids_list.append(torch.tensor(tr_ids, dtype=torch.long))
             keep.append(i)
 
         if not keep:
@@ -69,44 +70,60 @@ class AuraCollator:
         max_mel  = int(mel_lens.max().item())
         mel_pad  = torch.zeros(len(keep), max_mel, 80)
         for j, i in enumerate(keep):
-            b = batch[i]
-            mel_pad[j, : b["mel_len"]] = b["mel"]
+            mel_pad[j, : batch[i]["mel_len"]] = batch[i]["mel"]
 
-        # 3. Pad target token ids
-        target_lens = torch.tensor([t.size(0) for t in target_ids_list], dtype=torch.long)
-        max_target  = int(target_lens.max().item())
-        target_pad  = torch.zeros(len(keep), max_target, dtype=torch.long)
-        for j, t in enumerate(target_ids_list):
-            target_pad[j, : t.size(0)] = t
+        # 3. Pad transcript ids
+        transcript_lens = torch.tensor(
+            [t.size(0) for t in transcript_ids_list], dtype=torch.long
+        )
+        max_t = max(int(transcript_lens.max().item()), 1)
+        transcript_pad = torch.zeros(len(keep), max_t, dtype=torch.long)
+        for j, t in enumerate(transcript_ids_list):
+            if t.size(0) > 0:
+                transcript_pad[j, : t.size(0)] = t
+
+        # 4. Pad translation ids (zero-length for ASR samples)
+        translation_lens = torch.tensor(
+            [t.size(0) for t in translation_ids_list], dtype=torch.long
+        )
+        max_r = max(int(translation_lens.max().item()), 1)
+        translation_pad = torch.zeros(len(keep), max_r, dtype=torch.long)
+        for j, t in enumerate(translation_ids_list):
+            if t.size(0) > 0:
+                translation_pad[j, : t.size(0)] = t
 
         out: dict[str, Any] = {
-            "audio_features": mel_pad,               # (B, T_mel, 80)
-            "audio_lengths":  mel_lens,               # (B,)
-            "target_ids":     target_pad,             # (B, L_target)
-            "target_lengths": target_lens,            # (B,)
-            "language":       [batch[i]["language"] for i in keep],
+            "audio_features":      mel_pad,
+            "audio_lengths":       mel_lens,
+            "transcript_ids":      transcript_pad,
+            "transcript_lengths":  transcript_lens,
+            "translation_ids":     translation_pad,
+            "translation_lengths": translation_lens,
+            "src_language":        [batch[i]["src_language"] for i in keep],
+            "tgt_language":        [batch[i]["tgt_language"] for i in keep],
+            "task":                [batch[i]["task"]         for i in keep],
         }
 
-        # 4. Optional CTC labels
+        # 5. Optional CTC labels — always built from the SOURCE transcript
         if self.vocab is not None:
             ctc_list:    list[torch.Tensor] = []
             ctc_lengths: list[int]           = []
             for i in keep:
-                text    = batch[i]["text"]
+                text = batch[i]["transcript"]
                 encoded = []
                 for c in text:
                     if c in self.vocab:
                         encoded.append(self.vocab[c])
                     elif " " in self.vocab:
                         encoded.append(self.vocab[" "])
-                # if neither the character nor space exists, omit it to avoid crashing the embedder
                 ctc_list.append(torch.tensor(encoded, dtype=torch.long))
                 ctc_lengths.append(len(encoded))
 
-            max_ctc = max(len(t) for t in ctc_list) if ctc_list else 0
+            max_ctc = max(max(len(t) for t in ctc_list), 1) if ctc_list else 1
             ctc_pad = torch.zeros(len(keep), max_ctc, dtype=torch.long)
             for j, lab in enumerate(ctc_list):
-                ctc_pad[j, : lab.size(0)] = lab
+                if lab.size(0) > 0:
+                    ctc_pad[j, : lab.size(0)] = lab
 
             out["ctc_labels"]        = ctc_pad
             out["ctc_label_lengths"] = torch.tensor(ctc_lengths, dtype=torch.long)

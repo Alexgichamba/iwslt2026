@@ -34,6 +34,26 @@ LANG_MAP: dict[str, int] = {
 # Special token IDs
 AUDIO_PLACEHOLDER_ID = 11   # <|reserved_special_token_6|>
 TRANSCRIPT_START_ID  = 12   # <|reserved_special_token_7|>
+TASK_ASR_ID          = 13   # <|reserved_special_token_8|>
+TASK_COT_ID          = 14   # <|reserved_special_token_9|>
+TRANSLATE_START_ID   = 15   # <|reserved_special_token_10|>
+
+def verify_special_token_ids(tokenizer) -> None:
+    """Verify reserved-token assignments still point at reserved slots."""
+    expected = {
+        AUDIO_PLACEHOLDER_ID: "audio_placeholder",
+        TRANSCRIPT_START_ID:  "transcript_start",
+        TASK_ASR_ID:          "task_asr",
+        TASK_COT_ID:          "task_cot",
+        TRANSLATE_START_ID:   "translate_start",
+    }
+    for tok_id, role in expected.items():
+        decoded = tokenizer.decode([tok_id])
+        if not (decoded.startswith("<|") and decoded.endswith("|>")):
+            raise ValueError(
+                f"Token id {tok_id} (role={role}) decodes to '{decoded}', "
+                f"expected a reserved special token. Update token IDs in aura.py."
+            )
 
 
 class AuraLLM(nn.Module):
@@ -74,10 +94,15 @@ class AuraLLM(nn.Module):
         if special:
             self.tokenizer.add_special_tokens(special)
 
+        verify_special_token_ids(self.tokenizer)
+
         self.bos_id  = self.tokenizer.bos_token_id or 0
         self.eos_id  = self.tokenizer.eos_token_id or 1
-        self.audio_token_id    = AUDIO_PLACEHOLDER_ID
+        self.audio_token_id      = AUDIO_PLACEHOLDER_ID
         self.transcript_start_id = TRANSCRIPT_START_ID
+        self.task_asr_id         = TASK_ASR_ID
+        self.task_cot_id         = TASK_COT_ID
+        self.translate_start_id  = TRANSLATE_START_ID
 
         # --- LLM ---
         # llama3 and model_factory live in st/models/ alongside this file
