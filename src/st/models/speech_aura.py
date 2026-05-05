@@ -383,9 +383,13 @@ class SpeechAura(nn.Module):
         generated  = []
         next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
+        stop_ids = {self.aura.eos_id}
+        if task == "asr":
+            stop_ids.add(self.aura.translate_start_id)
+
         for step in range(max_new_tokens):
             tok = int(next_token.item())
-            if tok == self.aura.eos_id:
+            if tok in stop_ids:
                 break
             generated.append(tok)
 

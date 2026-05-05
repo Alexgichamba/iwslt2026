@@ -41,7 +41,6 @@ def audio_to_mel(waveform: torch.Tensor, sample_rate: int = 16000) -> torch.Tens
     )
     mel = mel_transform(waveform)
     mel = torch.clamp(mel, min=1e-10).log10()
-    mel = (mel + 4.0) / 4.0
     return mel.T   # (T, 80)
 
 
