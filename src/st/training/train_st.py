@@ -1,5 +1,5 @@
 """
-Stage 2 / 3 / 4 — Speech Translation training.
+Stage 2 / 3 / 4 — Speech Translation training with DDP support.
 
 Stage 2: Freeze encoder + LLM, train projector only.
 Stage 3: Freeze encoder + LLM, train projector + LoRA.
@@ -8,12 +8,20 @@ Stage 4: Train everything (encoder + projector + full LLM).
 Controlled entirely by the experiment YAML — no code changes needed to
 switch stages.
 
-interact -p GPU-shared --gres=gpu:v100-32:1 -t 8:00:00 -A cis250145p
-interact -p GPU-shared --gres=gpu:h100-80:1 -t 8:00:00 -A cis250145p
+Single GPU:
+    PYTHONPATH=src python -m st.training.train_st \
+        --config configs/experiment/stage3.yaml
 
-PYTHONPATH=$(pwd) python -m st.training.train_st --config configs/experiment/stage{x}.yaml --resume_from runs/stage{x}/checkpoint_step{x}000/
+Multi-GPU (torchrun):
+    torchrun --standalone --nproc_per_node=4 \
+        -m st.training.train_st \
+        --config configs/experiment/stage3.yaml
 
-    python -m st.training.train_st --config configs/experiment/stage2.yaml
+Resume:
+    torchrun --standalone --nproc_per_node=4 \
+        -m st.training.train_st \
+        --config configs/experiment/stage3.yaml \
+        --resume_from runs/stage3/checkpoint_step10000
 """
 
 from __future__ import annotations
@@ -28,6 +36,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from st.data import SpeechDataset, AuraCollator, DurationBucketSampler
@@ -39,6 +48,8 @@ from st.models import (
 from st.utils.config import load_config
 from st.utils.schedulers import build_scheduler
 from st.utils.metrics import compute_wer, compute_bleu, compute_chrf
+from st.utils.ddp_utils import setup_ddp, teardown_ddp, reduce_tensor, barrier
+import torch.distributed as dist
 
 log = logging.getLogger(__name__)
 
@@ -58,7 +69,7 @@ def build_model(cfg: dict) -> SpeechAura:
     encoder = load_encoder_from_checkpoint(
         config=enc_cfg,
         checkpoint_path=enc_cfg.get("checkpoint"),
-        vocab_size=enc_cfg.get("vocab_size"),   # required if ctc_weight>0 or ctc_compress
+        vocab_size=enc_cfg.get("vocab_size"),
         strict=False,
     )
 
@@ -108,7 +119,7 @@ def build_model(cfg: dict) -> SpeechAura:
 
 
 # ============================================================================
-# Load a checkpoint into an existing model (for resume)
+# Checkpoint load / save  (always operate on raw_model, never DDP wrapper)
 # ============================================================================
 
 def load_checkpoint(
@@ -117,7 +128,7 @@ def load_checkpoint(
     scheduler,
     path: str,
 ) -> int:
-    """Load checkpoint directory. Returns the step number."""
+    """Load checkpoint directory into raw (unwrapped) model. Returns step."""
     import json
 
     model.load_checkpoint(path)
@@ -147,10 +158,6 @@ def load_checkpoint(
     return step
 
 
-# ============================================================================
-# Save checkpoint
-# ============================================================================
-
 def save_checkpoint(
     model: SpeechAura,
     optimizer: torch.optim.Optimizer,
@@ -158,6 +165,7 @@ def save_checkpoint(
     step: int,
     output_dir: str,
 ) -> str:
+    """Save checkpoint. Must only be called on master rank."""
     import json
     ckpt_dir = os.path.join(output_dir, f"checkpoint_step{step}")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -167,7 +175,6 @@ def save_checkpoint(
     if scheduler is not None:
         torch.save(scheduler.state_dict(), f"{ckpt_dir}/scheduler.pt")
 
-    # Overwrite meta with step
     meta_path = f"{ckpt_dir}/meta.json"
     meta = {}
     if os.path.exists(meta_path):
@@ -189,11 +196,7 @@ def build_val_generate_indices(
     val_ds: SpeechDataset,
     samples_per_lang: int = 100,
 ) -> list[int]:
-    """Return the first `samples_per_lang` indices per language from val_ds.
-
-    Iterates entries in dataset order (no shuffling) so the result is
-    fully deterministic and stable across resumes.
-    """
+    """Return the first `samples_per_lang` indices per language. Deterministic."""
     from collections import defaultdict
     lang_indices: dict[str, list[int]] = defaultdict(list)
     for idx, entry in enumerate(val_ds.entries):
@@ -212,7 +215,7 @@ def build_val_generate_indices(
 
 
 # ============================================================================
-# Validation
+# Validation  (master rank only)
 # ============================================================================
 
 @torch.no_grad()
@@ -225,8 +228,12 @@ def evaluate(
     step: int = 0,
     output_dir: str | None = None,
 ) -> dict[str, float]:
-    """Run validation. WER on transcript portion always; for CoT also BLEU/chrF
-    on translation portion."""
+    """Run validation on the raw (unwrapped) model.
+
+    Called on master rank only — no DDP communication here.
+    Loss is computed over the full val set; generation runs on
+    val_generate_indices samples.
+    """
     from collections import defaultdict
     from tqdm import tqdm
 
@@ -299,7 +306,6 @@ def evaluate(
             lang_hyp_r[lang].append(h_r)
             lang_ref_r[lang].append(r_r)
 
-        # Transcript metrics (always)
         from jiwer import wer as _sample_wer
         per_sample_wer = []
         for r, p in zip(ref_transcripts, hyp_transcripts):
@@ -314,7 +320,6 @@ def evaluate(
             results[f"wer_{lang}"] = lang_wer
             log.info(f"  val WER [{lang}]: {lang_wer:.4f} ({len(lang_hyp_t[lang])} samples)")
 
-        # Translation metrics (CoT only)
         if task == "cot":
             results["bleu"] = compute_bleu(hyp_translations, ref_translations)["bleu"]
             results["chrf"] = compute_chrf(hyp_translations, ref_translations)["chrf"]
@@ -328,7 +333,6 @@ def evaluate(
                     f"({len(lang_hyp_r[lang])} samples)"
                 )
 
-        # Log a few examples per language
         logged: dict[str, int] = defaultdict(int)
         for h_t, r_t, h_r, r_r, lang in zip(
             hyp_transcripts, ref_transcripts,
@@ -343,7 +347,6 @@ def evaluate(
                     log.info(f"  [val {lang}] hyp_r: {h_r[:80]}")
                 logged[lang] += 1
 
-        # Write CSV
         if output_dir is not None:
             csv_path = os.path.join(output_dir, f"val_preds_step{step}.csv")
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -384,23 +387,44 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%H:%M:%S",
     )
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ---- DDP setup ----
+    is_ddp, rank, local_rank, world_size, device_str = setup_ddp()
+    master = (rank == 0)
+    device = torch.device(device_str)
+
+    if master:
+        log.info(f"DDP: {'enabled' if is_ddp else 'disabled'} | "
+                 f"rank={rank} | world_size={world_size} | device={device_str}")
 
     train_cfg  = cfg["training"]
     data_cfg   = cfg["data"]
     output_dir = train_cfg.get("output_dir", "runs/speech_aura")
-    os.makedirs(output_dir, exist_ok=True)
+
+    # Only master creates directories
+    if master:
+        os.makedirs(output_dir, exist_ok=True)
 
     task = data_cfg.get("task") or train_cfg.get("task", "asr")
     if task not in ("asr", "cot"):
         raise ValueError(f"data.task must be 'asr' or 'cot', got '{task}'")
-    log.info(f"Training task: {task}")
+    if master:
+        log.info(f"Training task: {task}")
 
-    # --- Model ---
+    # ---- Model ----
+    # All ranks build the model identically (same weights loaded from checkpoint)
     model = build_model(cfg).to(device)
 
-    lowercase = data_cfg.get("lowercase", False)
+    # Wrap with DDP — gradient all-reduce happens automatically during backward()
+    if is_ddp:
+        model = DDP(model, device_ids=[local_rank])
 
+    # raw_model is used for: save/load checkpoint, generate, evaluate
+    # — these must bypass the DDP wrapper
+    raw_model: SpeechAura = model.module if is_ddp else model
+
+    # ---- Data ----
+    lowercase     = data_cfg.get("lowercase", False)
     src_languages = data_cfg.get("src_languages") or data_cfg.get("languages")
     tgt_languages = data_cfg.get("tgt_languages")
 
@@ -425,27 +449,35 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             lowercase=lowercase,
         )
 
-    # Vocab for CTC labels (only needed when ctc_weight > 0)
     vocab = None
     if train_cfg.get("ctc_weight", 0.0) > 0:
         from st.data.vocab import load_vocab
         vocab = load_vocab(data_cfg["vocab_path"])
-        log.info(f"CTC vocab loaded: {len(vocab)} tokens")
+        if master:
+            log.info(f"CTC vocab loaded: {len(vocab)} tokens")
 
     collator = AuraCollator(
-        tokenizer=model.aura.tokenizer,
+        tokenizer=raw_model.aura.tokenizer,
         vocab=vocab,
         max_target_tokens=train_cfg.get("max_target_tokens", 256),
     )
 
+    # Synchronized bucket sampler: shared seed for bucket ORDER (all ranks),
+    # per-rank seed for sample ORDER within buckets (preserves data parallelism)
     train_sampler = DurationBucketSampler(
         dataset=train_ds,
         target_duration=train_cfg.get("max_batch_duration", 120.0),
         max_batch_size=train_cfg.get("max_batch_size", 64),
         shuffle=True,
         shuffle_buckets=True,
+        rank=rank,
+        world_size=world_size,
+        seed=42,
     )
-    log.info(f"Train: {len(train_ds)} samples, {len(train_sampler)} batches/epoch")
+    if master:
+        log.info(f"Train: {len(train_ds)} samples, {len(train_sampler)} batches/epoch "
+                 f"(world_size={world_size}, effective_batch ≈ "
+                 f"{train_cfg.get('max_batch_duration', 120.0) * world_size:.0f}s/step)")
 
     train_loader = DataLoader(
         train_ds,
@@ -454,8 +486,11 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         collate_fn=collator,
         pin_memory=True,
     )
+
+    # Validation: only master runs evaluate(), so only master needs val_loader
     val_loader = None
-    if val_ds:
+    val_generate_indices: list[int] = []
+    if master and val_ds is not None:
         val_sampler = DurationBucketSampler(
             dataset=val_ds,
             target_duration=train_cfg.get("max_batch_duration", 120.0),
@@ -470,14 +505,10 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             collate_fn=collator,
             pin_memory=True,
         )
-
-    # Build fixed val generation indices once — first N per language, deterministic
-    val_generate_indices: list[int] = []
-    if val_ds is not None:
         samples_per_lang = train_cfg.get("val_samples_per_lang", 100)
         val_generate_indices = build_val_generate_indices(val_ds, samples_per_lang)
 
-    # --- Optimizer ---
+    # ---- Optimizer ----
     trainable = [p for p in model.parameters() if p.requires_grad]
     lr     = float(train_cfg.get("lr", 2e-4))
     min_lr = float(train_cfg.get("min_lr", 1e-6))
@@ -487,7 +518,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         weight_decay=train_cfg.get("weight_decay", 0.01),
     )
 
-    # --- Scheduler ---
+    # ---- Scheduler ----
     max_steps = train_cfg["max_steps"]
     scheduler = build_scheduler(
         name=train_cfg.get("scheduler", "cosine_warmup_restarts"),
@@ -500,14 +531,15 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         gamma=train_cfg.get("gamma", 1.0),
     )
 
-    # --- Resume ---
+    # ---- Resume ----
+    # Load on all ranks so weights + optimizer state are identical everywhere
     start_step = 0
     if resume_from:
-        start_step = load_checkpoint(model, optimizer, scheduler, resume_from)
+        start_step = load_checkpoint(raw_model, optimizer, scheduler, resume_from)
 
-    # --- W&B ---
+    # ---- W&B — master only ----
     use_wandb = not train_cfg.get("no_wandb", False)
-    if use_wandb:
+    if master and use_wandb:
         try:
             import wandb
             wandb.init(
@@ -520,30 +552,51 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             log.info(f"W&B: {wandb.run.url}")
         except ImportError:
             use_wandb = False
+    elif not master:
+        use_wandb = False  # non-master ranks never log to W&B
 
-    # --- Training loop ---
+    # ---- Training loop ----
     model.train()
-    global_step   = start_step
-    epoch         = 0
-    grad_accum    = train_cfg.get("grad_accum", 8)
-    log_every     = train_cfg.get("log_every", 100)
-    save_every    = train_cfg.get("save_every", 5000)
-    eval_every    = train_cfg.get("eval_every", 5000)
-    oom_cooldown  = 0
+    global_step  = start_step
+    epoch        = 0
+    grad_accum   = train_cfg.get("grad_accum", 8)
+    log_every    = train_cfg.get("log_every", 100)
+    save_every   = train_cfg.get("save_every", 5000)
+    eval_every   = train_cfg.get("eval_every", 5000)
+    oom_cooldown = 0
 
     running: dict[str, float] = {"loss": 0.0, "ce_loss": 0.0, "ctc_loss": 0.0}
-    run_n = 0
+    run_n      = 0
     micro_step = 0
 
     from tqdm import tqdm
-    pbar = tqdm(total=max_steps - start_step, desc="Training", unit="step", dynamic_ncols=True)
+    # Only master shows the progress bar
+    pbar = tqdm(
+        total=max_steps - start_step,
+        desc="Training",
+        unit="step",
+        dynamic_ncols=True,
+        disable=not master,
+    )
 
-    log.info(f"Training for {max_steps} steps (resuming from {start_step})")
+    if master:
+        log.info(f"Training for {max_steps} steps (resuming from {start_step})")
     optimizer.zero_grad()
 
     while global_step < max_steps:
         epoch += 1
+
+        # Advance the sampler RNG at the start of each epoch so all ranks
+        # stay synchronized on bucket order while seeing different samples
+        train_sampler.set_epoch(epoch)
+
         for batch in train_loader:
+            # Synchronize cooldown across ranks
+            if is_ddp and oom_cooldown > 0:
+                cooldown_tensor = torch.tensor(oom_cooldown, dtype=torch.int32, device=device)
+                dist.all_reduce(cooldown_tensor, op=dist.ReduceOp.MAX)
+                oom_cooldown = int(cooldown_tensor.item())
+
             if batch is None or oom_cooldown > 0:
                 oom_cooldown = max(0, oom_cooldown - 1)
                 continue
@@ -551,22 +604,33 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
             cur_bs  = batch["audio_features"].size(0)
-            cur_dur = batch["audio_lengths"].sum().item() * 0.01  # frames × 10ms
+            cur_dur = batch["audio_lengths"].sum().item() * 0.01
 
+            oom_this_step = False
             try:
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-                    out = model(**batch)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                        enabled=(device.type == "cuda")):
+                    out  = model(**batch)
                     loss = out["loss"] / grad_accum
-
                 loss.backward()
 
             except torch.cuda.OutOfMemoryError:
-                log.warning(
-                    f"OOM at step {global_step}: bs={cur_bs} — skipping"
-                )
+                oom_this_step = True
                 optimizer.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
                 gc.collect()
+                torch.cuda.empty_cache()
+
+            # Synchronize OOM across all ranks — if any rank OOM'd, all skip
+            if is_ddp:
+                oom_tensor = torch.tensor(int(oom_this_step), dtype=torch.int32, device=device)
+                dist.all_reduce(oom_tensor, op=dist.ReduceOp.MAX)
+                oom_this_step = bool(oom_tensor.item())
+
+            if oom_this_step:
+                if master:
+                    log.warning(f"OOM at step {global_step}: bs={cur_bs} — all ranks skipping")
+                optimizer.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
                 oom_cooldown = 3
                 micro_step = (micro_step // grad_accum) * grad_accum
@@ -574,10 +638,10 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                 run_n = 0
                 continue
 
-            # Accumulate metrics (unscaled)
+            # Accumulate unscaled metrics
             for k in ("loss", "ce_loss", "ctc_loss"):
                 running[k] += out[k].item()
-            run_n += 1
+            run_n      += 1
             micro_step += 1
 
             if micro_step % grad_accum == 0:
@@ -590,40 +654,60 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                     scheduler.step()
 
                 global_step += 1
-                pbar.update(1)
+                if master:
+                    pbar.update(1)
 
-            pbar.set_postfix(
-                loss=f"{out['loss'].item():.3f}",
-                lr=f"{optimizer.param_groups[0]['lr']:.1e}",
-                bs=cur_bs, dur=f"{cur_dur:.0f}s", ep=epoch,
-            )
-
-            if global_step % log_every == 0 and run_n > 0 and micro_step % grad_accum == 0:
-                avg   = {k: v / run_n for k, v in running.items()}
-                cur_lr = optimizer.param_groups[0]["lr"]
-                log.info(
-                    f"step {global_step}/{max_steps} | "
-                    + " | ".join(f"{k}={v:.4f}" for k, v in avg.items())
-                    + f" | lr={cur_lr:.2e} | bs={cur_bs} | dur={cur_dur:.0f}s"
+            if master:
+                pbar.set_postfix(
+                    loss=f"{out['loss'].item():.3f}",
+                    lr=f"{optimizer.param_groups[0]['lr']:.1e}",
+                    bs=cur_bs, dur=f"{cur_dur:.0f}s", ep=epoch,
                 )
-                if use_wandb:
-                    import wandb
-                    wandb.log(
-                        {f"train/{k}": v for k, v in avg.items()}
-                        | {"train/lr": cur_lr, "train/epoch": epoch,
-                           "train/batch_size": cur_bs, "train/batch_dur": cur_dur},
-                        step=global_step,
+
+            # ---- Logging (master only) ----
+            if global_step % log_every == 0 \
+                    and run_n > 0 and micro_step % grad_accum == 0:
+                
+                loss_for_log = out["loss"].detach().clone()
+                reduce_tensor(loss_for_log)  # both ranks participate
+
+                # Only master logs the result
+                if master:
+
+                    avg    = {k: v / run_n for k, v in running.items()}
+                    cur_lr = optimizer.param_groups[0]["lr"]
+                    log.info(
+                        f"step {global_step}/{max_steps} | "
+                        + " | ".join(f"{k}={v:.4f}" for k, v in avg.items())
+                        + f" | lr={cur_lr:.2e} | bs={cur_bs} | dur={cur_dur:.0f}s"
                     )
-                running = {k: 0.0 for k in running}
-                run_n = 0
+                    if use_wandb:
+                        import wandb
+                        wandb.log(
+                            {f"train/{k}": v for k, v in avg.items()}
+                            | {"train/lr": cur_lr, "train/epoch": epoch,
+                            "train/batch_size": cur_bs * world_size,
+                            "train/batch_dur": cur_dur * world_size},
+                            step=global_step,
+                        )
+                    running = {k: 0.0 for k in running}
+                    run_n   = 0
 
-            if global_step % save_every == 0 and micro_step % grad_accum == 0:
-                save_checkpoint(model, optimizer, scheduler, global_step, output_dir)
+            # ---- Checkpoint (master only) ----
+            if master and global_step > 0 \
+                and global_step % save_every == 0 \
+                and micro_step % grad_accum == 0:
+                save_checkpoint(raw_model, optimizer, scheduler, global_step, output_dir)
 
-            if val_loader and global_step % eval_every == 0 and micro_step % grad_accum == 0:
+            # ---- Validation (master only) ----
+            if master and val_loader is not None \
+                and global_step > 0 \
+                and global_step % eval_every == 0 \
+                and micro_step % grad_accum == 0:
+
                 torch.cuda.empty_cache()
                 metrics = evaluate(
-                    model, val_loader, device, task,
+                    raw_model, val_loader, device, task,
                     val_generate_indices=val_generate_indices,
                     step=global_step, output_dir=output_dir,
                 )
@@ -633,30 +717,40 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                 )
                 if use_wandb:
                     import wandb
-                    wandb.log({f"val/{k}": v for k, v in metrics.items()}, step=global_step)
+                    wandb.log({f"val/{k}": v for k, v in metrics.items()},
+                              step=global_step)
+                model.train()  # restore train mode after evaluate()
 
             if global_step >= max_steps:
                 break
 
     pbar.close()
-    save_checkpoint(model, optimizer, scheduler, global_step, output_dir)
 
-    if val_loader:
-        metrics = evaluate(
-            model, val_loader, device, task,
-            val_generate_indices=val_generate_indices,
-            step=global_step, output_dir=output_dir,
-        )
-        log.info("Final val | " + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+    # ---- Final checkpoint and eval ----
+    if master:
+        save_checkpoint(raw_model, optimizer, scheduler, global_step, output_dir)
+
+        if val_loader is not None:
+            metrics = evaluate(
+                raw_model, val_loader, device, task,
+                val_generate_indices=val_generate_indices,
+                step=global_step, output_dir=output_dir,
+            )
+            log.info("Final val | " + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+            if use_wandb:
+                import wandb
+                wandb.log({f"val/{k}": v for k, v in metrics.items()}, step=global_step)
+
         if use_wandb:
             import wandb
-            wandb.log({f"val/{k}": v for k, v in metrics.items()}, step=global_step)
+            wandb.finish()
 
-    if use_wandb:
-        import wandb
-        wandb.finish()
+    # All ranks wait here before tearing down
+    barrier()
+    teardown_ddp()
 
-    log.info("Training complete.")
+    if master:
+        log.info("Training complete.")
 
 
 # ============================================================================
@@ -669,7 +763,6 @@ def main() -> None:
     parser.add_argument("--resume_from", default=None,  help="Checkpoint directory to resume from")
     args = parser.parse_args()
 
-    from st.utils.config import load_config
     cfg = load_config(args.config)
     train(cfg, resume_from=args.resume_from)
 
