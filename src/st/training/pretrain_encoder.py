@@ -28,13 +28,14 @@ import csv
 import logging
 import os
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from st.data.dataset import SpeechDataset
@@ -53,8 +54,12 @@ log = logging.getLogger(__name__)
 # CTC collator
 # ============================================================================
 
-def ctc_collate(batch: list[dict], vocab: dict[str, int]) -> dict[str, torch.Tensor]:
-    """Pad mel features and encode transcripts as CTC integer sequences."""
+def ctc_collate(batch: list[dict], vocab: dict[str, int]) -> dict:
+    """Pad mel features and encode transcripts as CTC integer sequences.
+
+    Also carries `src_languages` through so the eval loop can bucket WER
+    by language without re-reading the index.
+    """
     mel_lens = torch.tensor([b["mel_len"] for b in batch], dtype=torch.long)
     max_mel  = int(mel_lens.max().item())
     mel_pad  = torch.zeros(len(batch), max_mel, 80)
@@ -78,7 +83,58 @@ def ctc_collate(batch: list[dict], vocab: dict[str, int]) -> dict[str, torch.Ten
         "feature_lengths": mel_lens,
         "labels":          lab_pad,
         "label_lengths":   torch.tensor(label_lengths, dtype=torch.long),
+        "src_languages":   [b["src_language"] for b in batch],
+        "transcripts":     [b["transcript"] for b in batch],
     }
+
+
+# ============================================================================
+# CTC greedy decode helper
+# ============================================================================
+
+def ctc_greedy_decode(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    idx_to_char: dict[int, str],
+    blank_id: int = 0,
+) -> list[str]:
+    """Greedy CTC decoding: argmax → collapse repeats → drop blanks."""
+    pred_ids = logits.argmax(dim=-1)   # (B, T)
+    out: list[str] = []
+    for i in range(pred_ids.size(0)):
+        seq = pred_ids[i, : lengths[i]].tolist()
+        decoded, prev = [], -1
+        for tid in seq:
+            if tid != blank_id and tid != prev:
+                decoded.append(idx_to_char.get(tid, ""))
+            prev = tid
+        out.append("".join(decoded))
+    return out
+
+
+# ============================================================================
+# Val index selection
+# ============================================================================
+
+def build_val_generate_indices(
+    val_ds: SpeechDataset,
+    samples_per_lang: int = 100,
+) -> list[int]:
+    """Return the first `samples_per_lang` indices per language. Deterministic."""
+    lang_indices: dict[str, list[int]] = defaultdict(list)
+    for idx, entry in enumerate(val_ds.entries):
+        lang = entry.get("language") or entry.get("src_language") or "?"
+        if len(lang_indices[lang]) < samples_per_lang:
+            lang_indices[lang].append(idx)
+
+    indices: list[int] = []
+    for lang in sorted(lang_indices):
+        n = len(lang_indices[lang])
+        log.info(f"  Val decode: {n} samples for language '{lang}'")
+        indices.extend(lang_indices[lang])
+
+    log.info(f"Val decode indices: {len(indices)} total ({len(lang_indices)} languages)")
+    return indices
 
 
 # ============================================================================
@@ -88,62 +144,89 @@ def ctc_collate(batch: list[dict], vocab: dict[str, int]) -> dict[str, torch.Ten
 @torch.no_grad()
 def validate(
     model: SpeechEncoder,
-    loader: DataLoader,
+    val_loader: DataLoader,
     device: torch.device,
     vocab: dict[str, int],
     step: int = 0,
     output_dir: Path | None = None,
 ) -> dict[str, float]:
+    """Single-pass eval on a bounded subset (~val_samples_per_lang × N_langs).
+
+    Computes mean CTC loss and greedy WER (overall + per-language) in one
+    sweep, plus a per-sample CSV. Full val sets are too large to score on
+    every checkpoint, so the loader passed here must already be built over
+    the bounded subset.
+    """
     model.eval()
     ctc_loss_fn = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
     idx_to_char = {v: k for k, v in vocab.items()}
 
     total_loss, n_batches = 0.0, 0
-    preds: list[str] = []
-    refs:  list[str] = []
+    lang_hyp: dict[str, list[str]] = defaultdict(list)
+    lang_ref: dict[str, list[str]] = defaultdict(list)
+    all_rows: list[tuple[str, str, str]] = []   # (lang, ref, hyp)
 
-    for batch in loader:
+    for batch in tqdm(val_loader, desc=f"val step {step}",
+                      unit="batch", dynamic_ncols=True, leave=False):
         features        = batch["features"].to(device)
         feature_lengths = batch["feature_lengths"].to(device)
         labels          = batch["labels"].to(device)
         label_lengths   = batch["label_lengths"].to(device)
 
-        out      = model(features, feature_lengths)
+        out       = model(features, feature_lengths)
         log_probs = out["ctc_logits"].log_softmax(dim=-1).transpose(0, 1)
-        loss     = ctc_loss_fn(log_probs, labels, out["lengths"], label_lengths)
-
+        loss      = ctc_loss_fn(log_probs, labels, out["lengths"], label_lengths)
         total_loss += loss.item()
         n_batches  += 1
 
-        # Greedy decode
-        pred_ids = out["ctc_logits"].argmax(dim=-1)
-        for i in range(pred_ids.size(0)):
-            seq = pred_ids[i, : out["lengths"][i]].tolist()
-            decoded, prev = [], -1
-            for tid in seq:
-                if tid != 0 and tid != prev:
-                    decoded.append(idx_to_char.get(tid, ""))
-                prev = tid
-            preds.append("".join(decoded))
-            ref_seq = labels[i, : label_lengths[i]].tolist()
-            refs.append("".join(idx_to_char.get(t, "") for t in ref_seq))
+        hyps = ctc_greedy_decode(
+            out["ctc_logits"], out["lengths"], idx_to_char, blank_id=0,
+        )
+        for hyp, ref, lang in zip(hyps, batch["transcripts"], batch["src_languages"]):
+            lang_hyp[lang].append(hyp)
+            lang_ref[lang].append(ref)
+            all_rows.append((lang, ref, hyp))
 
-    avg_loss = total_loss / max(n_batches, 1)
-    wer      = compute_wer(preds, refs) if refs else 0.0
+    metrics: dict[str, float] = {"val/ctc_loss": total_loss / max(n_batches, 1)}
 
-    if output_dir is not None:
+    if all_rows:
+        all_hyp = [h for _, _, h in all_rows]
+        all_ref = [r for _, r, _ in all_rows]
+        metrics["val/wer"] = compute_wer(all_hyp, all_ref)
+
+        for lang in sorted(lang_hyp):
+            lang_wer = compute_wer(lang_hyp[lang], lang_ref[lang])
+            metrics[f"val/wer_{lang}"] = lang_wer
+            log.info(f"  val WER [{lang}]: {lang_wer:.4f} "
+                     f"({len(lang_hyp[lang])} samples)")
+
+        # Log a couple of examples per language for sanity
+        logged: dict[str, int] = defaultdict(int)
+        for lang, ref, hyp in all_rows:
+            if logged[lang] < 2:
+                log.info(f"  [val {lang}] ref: {ref[:80]}")
+                log.info(f"  [val {lang}] hyp: {hyp[:80]}")
+                logged[lang] += 1
+
+    if output_dir is not None and all_rows:
+        from jiwer import wer as _sample_wer
         output_dir.mkdir(parents=True, exist_ok=True)
         csv_path = output_dir / f"val_preds_step{step}.csv"
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["reference", "prediction"])
-            for r, p in zip(refs, preds):
-                writer.writerow([r, p])
-        n_empty = sum(1 for p in preds if not p.strip())
-        log.info(f"Val preds saved → {csv_path} ({n_empty} empty)")
+            writer.writerow(["idx", "src_lang", "ref", "hyp", "wer"])
+            for i, (lang, ref, hyp) in enumerate(all_rows):
+                try:
+                    w = _sample_wer(ref, hyp) if ref.strip() else 0.0
+                except Exception:
+                    w = 1.0
+                writer.writerow([i, lang, ref, hyp, f"{w:.4f}"])
+        n_empty = sum(1 for _, _, h in all_rows if not h.strip())
+        log.info(f"Val preds saved → {csv_path} "
+                 f"({len(all_rows)} samples, {n_empty} empty)")
 
     model.train()
-    return {"val/ctc_loss": avg_loss, "val/wer": wer}
+    return metrics
 
 
 # ============================================================================
@@ -266,7 +349,10 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         lowercase=data_cfg.get("lowercase", False),
     )
 
-    # Validation dataset and loader: master rank only
+    # Validation setup: master rank only.
+    # Eval is restricted to a bounded subset (val_samples_per_lang per
+    # language) — full val sets can be millions of rows, so even a batched
+    # loss pass is too slow.
     val_loader = None
     if master and data_cfg.get("val_index"):
         val_ds = SpeechDataset(
@@ -281,15 +367,21 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         def collate_fn(batch):
             return ctc_collate(batch, vocab)
 
+        samples_per_lang = train_cfg.get("val_samples_per_lang", 100)
+        val_indices = build_val_generate_indices(val_ds, samples_per_lang)
+        val_subset = Subset(val_ds, val_indices)
+        # Give the Subset a `.durations` attribute so DurationBucketSampler works
+        val_subset.durations = [val_ds.durations[i] for i in val_indices]
+
         val_sampler = DurationBucketSampler(
-            dataset=val_ds,
+            dataset=val_subset,
             target_duration=train_cfg.get("max_batch_duration", 240.0),
             max_batch_size=train_cfg.get("val_batch_size", 16),
             shuffle=False,
             shuffle_buckets=False,
         )
         val_loader = DataLoader(
-            val_ds,
+            val_subset,
             batch_sampler=val_sampler,
             num_workers=train_cfg.get("num_workers", 4),
             collate_fn=collate_fn,
@@ -318,8 +410,6 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         lr=float(train_cfg.get("lr", 1e-4)),
         weight_decay=train_cfg.get("weight_decay", 0.01),
     )
-    # Flat scheduler keys — same layout as stage 2/3/4/5 configs.
-    # `scheduler` key is just the name string (e.g. "cosine_warmup_restarts").
     scheduler = build_scheduler(
         name=train_cfg.get("scheduler", "cosine_warmup_restarts"),
         optimizer=optimizer,

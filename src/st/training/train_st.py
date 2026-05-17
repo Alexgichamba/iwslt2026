@@ -231,8 +231,9 @@ def evaluate(
     """Run validation on the raw (unwrapped) model.
 
     Called on master rank only — no DDP communication here.
-    Loss is computed over the full val set; generation runs on
-    val_generate_indices samples.
+    Both loss and generation are restricted to `val_generate_indices`
+    (~N_languages × val_samples_per_lang). val_loader must already be
+    built over the bounded subset.
     """
     from collections import defaultdict
     from tqdm import tqdm
@@ -254,7 +255,11 @@ def evaluate(
     results: dict[str, float] = {"loss": total_loss / max(n, 1)}
     torch.cuda.empty_cache()
 
+    # val_loader.dataset is a Subset over val_generate_indices; per-sample
+    # generation reads the underlying full dataset at the original indices.
     val_ds = val_loader.dataset
+    if hasattr(val_ds, "dataset"):
+        val_ds = val_ds.dataset
     src_langs_seen: list[str] = []
     hyp_transcripts:  list[str] = []
     ref_transcripts:  list[str] = []
@@ -487,26 +492,37 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         pin_memory=True,
     )
 
-    # Validation: only master runs evaluate(), so only master needs val_loader
+    # Validation: only master runs evaluate(), so only master needs val_loader.
+    # The loader is built over a bounded subset (val_samples_per_lang per
+    # language) — full val sets can be millions of rows, so even a batched
+    # loss pass is too slow.
     val_loader = None
     val_generate_indices: list[int] = []
     if master and val_ds is not None:
+        from torch.utils.data import Subset
+
+        samples_per_lang = train_cfg.get("val_samples_per_lang", 100)
+        val_generate_indices = build_val_generate_indices(val_ds, samples_per_lang)
+
+        val_subset = Subset(val_ds, val_generate_indices)
+        # DurationBucketSampler reads .durations directly; Subset doesn't
+        # forward attribute access, so attach it manually.
+        val_subset.durations = [val_ds.durations[i] for i in val_generate_indices]
+
         val_sampler = DurationBucketSampler(
-            dataset=val_ds,
+            dataset=val_subset,
             target_duration=train_cfg.get("max_batch_duration", 120.0),
             max_batch_size=train_cfg.get("max_batch_size", 64),
             shuffle=False,
             shuffle_buckets=False,
         )
         val_loader = DataLoader(
-            val_ds,
+            val_subset,
             batch_sampler=val_sampler,
             num_workers=train_cfg.get("num_workers", 4),
             collate_fn=collator,
             pin_memory=True,
         )
-        samples_per_lang = train_cfg.get("val_samples_per_lang", 100)
-        val_generate_indices = build_val_generate_indices(val_ds, samples_per_lang)
 
     # ---- Optimizer ----
     trainable = [p for p in model.parameters() if p.requires_grad]
