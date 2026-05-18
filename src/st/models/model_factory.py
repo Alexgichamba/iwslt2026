@@ -1,38 +1,47 @@
-import torch
+"""
+model_factory.py — model config builder.
+
+Builder for ModelArgs that decouples architectural shape from tokenizer
+choice and context length. API:
+    build_model_config(model_type, size, vocab_size, max_seq_len) -> ModelArgs
+"""
+
+from __future__ import annotations
+
 from st.models.llama3 import ModelArgs
 
 
-# interact -p GPU-shared --gres=gpu 
-def load_model(model, path, load_dict_only=False):
-    """Load a model from a checkpoint file."""
-    checkpoint = torch.load(path, map_location=torch.device('cpu'))
-    
-    # Handle state dict keys (with potential _orig_mod prefix from torch.compile)
-    state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-            
-    model.load_state_dict(state_dict)
-        
-    step = 0
-    if 'step' in checkpoint:
-        step = checkpoint['step']
-        
-    if not load_dict_only:
-        model.train() 
-    return model, step
+# ----------------------------------------------------------------------------
+#  Architectural presets — shape only. No vocab_size, no max_seq_len.
+# ----------------------------------------------------------------------------
 
-model_presets = {    'llama': {'124m': ModelArgs(n_layers=12, n_heads=12, dim=768, vocab_size=50304, max_seq_len=1024, intermediate_size=4 * 768, n_kv_heads=12),
-              '978m': ModelArgs(n_layers=36, n_heads=20, dim=1280, vocab_size=50304, max_seq_len=1024, intermediate_size=5120, n_kv_heads=4),
-              '1b': ModelArgs(n_layers=36, n_heads=20, dim=1280, vocab_size=50304, max_seq_len=1024, intermediate_size=5120, n_kv_heads=4),
-              '2b': ModelArgs(n_layers=36, n_heads=32, dim=2048, vocab_size=50304, max_seq_len=1024, intermediate_size=5120, n_kv_heads=8)},
+ARCH_PRESETS: dict[str, dict[str, dict]] = {
+    "llama-iwslt": {
+        "124m": dict(n_layers=12, n_heads=12, dim=768,  intermediate_size=4 * 768,  n_kv_heads=12),
+        "500m": dict(n_layers=32, n_heads=16, dim=1024, intermediate_size=3072,     n_kv_heads=4),
+        "978m": dict(n_layers=36, n_heads=20, dim=1280, intermediate_size=5120,     n_kv_heads=4),
+        "1b":   dict(n_layers=36, n_heads=20, dim=1280, intermediate_size=5120,     n_kv_heads=4),
+        "2b":   dict(n_layers=36, n_heads=32, dim=2048, intermediate_size=5120,     n_kv_heads=8),
+    },
+}
 
-    'llama-iwslt': {'124m': ModelArgs(n_layers=12, n_heads=12, dim=768, vocab_size=49157, max_seq_len=1024, intermediate_size=4 * 768, n_kv_heads=12),
-                    '500m': ModelArgs(n_layers=32, n_heads=16, dim=1024, vocab_size=49157, max_seq_len=1024, intermediate_size=3072, n_kv_heads=4),
-                    '978m': ModelArgs(n_layers=36, n_heads=20, dim=1280, vocab_size=49157, max_seq_len=1024, intermediate_size=5120, n_kv_heads=4),
-                    '1b': ModelArgs(n_layers=36, n_heads=20, dim=1280, vocab_size=49157, max_seq_len=1024, intermediate_size=5120, n_kv_heads=4),
-                    '2b': ModelArgs(n_layers=36, n_heads=32, dim=2048, vocab_size=49157, max_seq_len=1024, intermediate_size=5120, n_kv_heads=8),
-}
-}
+
+def build_model_config(
+    model_type: str,
+    size: str,
+    vocab_size: int,
+    max_seq_len: int,
+) -> ModelArgs:
+    """Build a ModelArgs combining architectural preset + runtime vocab/seq_len."""
+    if model_type not in ARCH_PRESETS:
+        raise ValueError(f"unknown model_type {model_type!r}; "
+                         f"expected one of {list(ARCH_PRESETS)}")
+    if size not in ARCH_PRESETS[model_type]:
+        raise ValueError(f"unknown size {size!r} for {model_type}; "
+                         f"expected one of {list(ARCH_PRESETS[model_type])}")
+    arch = ARCH_PRESETS[model_type][size]
+    return ModelArgs(
+        vocab_size=vocab_size,
+        max_seq_len=max_seq_len,
+        **arch,
+    )

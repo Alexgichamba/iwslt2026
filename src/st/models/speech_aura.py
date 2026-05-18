@@ -31,7 +31,6 @@ from st.models.projector import build_projector
 from st.models.ctc_compressor import CTCCompressor, build_ctc_compressor
 from st.models.aura import (
     AuraLLM,
-    AUDIO_PLACEHOLDER_ID, TRANSCRIPT_START_ID,
     TRANSLATE_START_ID, TASK_ASR_ID, TASK_COT_ID,
     LANG_MAP,
 )
@@ -158,25 +157,38 @@ class SpeechAura(nn.Module):
         transcript_lengths: torch.Tensor,
         translation_ids: torch.Tensor,
         translation_lengths: torch.Tensor,
+        src_languages: list[str],
         tgt_languages: list[str],
         tasks: list[str],
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build inputs_embeds, labels, and position_ids for the LLM.
 
-        ASR layout (length = N + L_t + 4):
-            [BOS, TGT_LANG, TASK_ASR, audio×N, TS, t1...tL_t]
-            labels at prompt_len..prompt_len+L_t-1 = transcript
-            label  at prompt_len+L_t                = EOS
+        Layout uses <|transcribe|> and <|translate|> as semantic segment
+        markers, each followed by a language token (matching the Aura
+        pretraining `<lang> text` adjacency). ASR is structurally a CoT
+        with the translation segment omitted.
 
-        CoT layout (length = N + L_t + L_r + 5):
-            [BOS, TGT_LANG, TASK_COT, audio×N, TS, t1...tL_t, TLS, r1...rL_r]
-            labels at prompt_len..prompt_len+L_t-1   = transcript
-            label  at prompt_len+L_t                  = TRANSLATE_START_ID
-            labels at prompt_len+L_t+1..+L_r          = translation
-            label  at prompt_len+L_t+1+L_r            = EOS
+        - src_languages[i]: language of the audio / transcript
+        - tgt_languages[i]: language of the translation (CoT only; ignored for ASR)
 
-        prompt_len = 3 + n_audio (position of TRANSCRIPT_START — predicts t1).
+        ASR layout (length S = 3 + N + L_t):
+            [BOS, audio×N, <|transcribe|>, SRC_LANG, t_1...t_{L_t}]
+
+            prompt_len = 2 + N    (position of SRC_LANG, predicts t_1)
+            lab[prompt_len .. prompt_len+L_t-1] = transcript
+            lab[prompt_len + L_t]               = EOS
+
+        CoT layout (length S = 5 + N + L_t + L_r):
+            [BOS, audio×N, <|transcribe|>, SRC_LANG, t_1...t_{L_t},
+             <|translate|>, TGT_LANG, r_1...r_{L_r}]
+
+            prompt_len = 2 + N
+            lab[prompt_len .. prompt_len+L_t-1]         = transcript
+            lab[prompt_len + L_t]                       = TRANSLATE_START_ID
+            lab[prompt_len + L_t + 1]                   = TGT_LANG
+            lab[prompt_len + L_t + 2 .. +L_t+1+L_r]     = translation
+            lab[prompt_len + L_t + 2 + L_r]             = EOS
         """
         embed_layer = self.aura.get_embed_layer()
         B = audio_embeds.size(0)
@@ -189,58 +201,63 @@ class SpeechAura(nn.Module):
             n_t     = int(transcript_lengths[i].item())
             n_r     = int(translation_lengths[i].item())
             task    = tasks[i]
-
-            tgt_lang_id = LANG_MAP.get(tgt_languages[i], LANG_MAP["eng"])
-            if task == "asr":
-                task_id = self.aura.task_asr_id
-            elif task == "cot":
-                task_id = self.aura.task_cot_id
-            else:
+            if task not in ("asr", "cot"):
                 raise ValueError(f"Unknown task '{task}' (expected 'asr' or 'cot')")
 
-            prefix_ids = torch.tensor(
-                [self.aura.bos_id, tgt_lang_id, task_id],
-                dtype=torch.long, device=device,
-            )
-            prefix_emb = embed_layer(prefix_ids)
-            audio_emb  = audio_embeds[i, :n_audio]
-            ts_emb = embed_layer(
-                torch.tensor([self.aura.transcript_start_id], dtype=torch.long, device=device)
-            )
+            src_lang_id = LANG_MAP.get(src_languages[i], LANG_MAP["eng"])
+            tgt_lang_id = LANG_MAP.get(tgt_languages[i], LANG_MAP["eng"])
 
+            bos_emb = embed_layer(
+                torch.tensor([self.aura.bos_id], dtype=torch.long, device=device)
+            )
+            audio_emb = audio_embeds[i, :n_audio]
+            transcribe_emb = embed_layer(
+                torch.tensor([self.aura.task_asr_id], dtype=torch.long, device=device)
+            )
+            src_lang_emb = embed_layer(
+                torch.tensor([src_lang_id], dtype=torch.long, device=device)
+            )
             transcript = transcript_ids[i, :n_t].to(device)
             transcript_emb = embed_layer(transcript)
 
+            prompt_len = 2 + n_audio  # position of SRC_LANG
+
             if task == "asr":
-                seq_emb = torch.cat([prefix_emb, audio_emb, ts_emb, transcript_emb], dim=0)
-                S = 3 + n_audio + 1 + n_t
+                seq_emb = torch.cat(
+                    [bos_emb, audio_emb, transcribe_emb, src_lang_emb, transcript_emb],
+                    dim=0,
+                )
+                S = 3 + n_audio + n_t
                 lab = torch.full((S,), -100, dtype=torch.long, device=device)
-                prompt_len = 3 + n_audio
                 if n_t > 0:
                     lab[prompt_len : prompt_len + n_t] = transcript
                 lab[prompt_len + n_t] = self.aura.eos_id
 
             else:  # cot
-                tls_emb = embed_layer(
-                    torch.tensor([self.aura.translate_start_id], dtype=torch.long, device=device)
+                translate_emb = embed_layer(
+                    torch.tensor([self.aura.translate_start_id],
+                                 dtype=torch.long, device=device)
+                )
+                tgt_lang_emb = embed_layer(
+                    torch.tensor([tgt_lang_id], dtype=torch.long, device=device)
                 )
                 translation = translation_ids[i, :n_r].to(device)
                 translation_emb = embed_layer(translation)
 
                 seq_emb = torch.cat([
-                    prefix_emb, audio_emb, ts_emb, transcript_emb,
-                    tls_emb, translation_emb,
+                    bos_emb, audio_emb, transcribe_emb, src_lang_emb, transcript_emb,
+                    translate_emb, tgt_lang_emb, translation_emb,
                 ], dim=0)
 
-                S = 3 + n_audio + 1 + n_t + 1 + n_r
+                S = 5 + n_audio + n_t + n_r
                 lab = torch.full((S,), -100, dtype=torch.long, device=device)
-                prompt_len = 3 + n_audio
                 if n_t > 0:
                     lab[prompt_len : prompt_len + n_t] = transcript
-                lab[prompt_len + n_t] = self.aura.translate_start_id
+                lab[prompt_len + n_t]     = self.aura.translate_start_id
+                lab[prompt_len + n_t + 1] = tgt_lang_id
                 if n_r > 0:
-                    lab[prompt_len + n_t + 1 : prompt_len + n_t + 1 + n_r] = translation
-                lab[prompt_len + n_t + 1 + n_r] = self.aura.eos_id
+                    lab[prompt_len + n_t + 2 : prompt_len + n_t + 2 + n_r] = translation
+                lab[prompt_len + n_t + 2 + n_r] = self.aura.eos_id
 
             seqs.append(seq_emb)
             labels_list.append(lab)
@@ -284,6 +301,7 @@ class SpeechAura(nn.Module):
         transcript_lengths: torch.Tensor,
         translation_ids: torch.Tensor,
         translation_lengths: torch.Tensor,
+        src_language: list[str],
         tgt_language: list[str],
         task: list[str],
         ctc_labels: torch.Tensor | None = None,
@@ -300,7 +318,7 @@ class SpeechAura(nn.Module):
             audio_embeds, audio_lens,
             transcript_ids, transcript_lengths,
             translation_ids, translation_lengths,
-            tgt_language, task, device,
+            src_language, tgt_language, task, device,
         )
 
         logits = self.aura(inputs_embeds, position_ids)
@@ -339,10 +357,21 @@ class SpeechAura(nn.Module):
         self,
         audio_features: torch.Tensor,
         audio_lengths: torch.Tensor,
-        target_lang: str = "eng",
+        src_lang: str,
+        tgt_lang: str = "eng",
         task: str = "asr",
         max_new_tokens: int = 256,
     ) -> str:
+        """Greedy generation.
+
+        Args:
+            src_lang: language of the audio (used in the transcript segment).
+            tgt_lang: language of the translation (CoT only; ignored for ASR).
+            task:     "asr" or "cot".
+
+        For CoT the model emits <|translate|><tgt_lang> mid-stream; ASR stops
+        at <|translate|> defensively.
+        """
         from st.models.kvcache import KVcache
 
         if task not in ("asr", "cot"):
@@ -353,20 +382,25 @@ class SpeechAura(nn.Module):
         n_audio = int(audio_lens[0].item())
 
         embed_layer = self.aura.get_embed_layer()
-        tgt_lang_id = LANG_MAP.get(target_lang, LANG_MAP["eng"])
-        task_id = self.aura.task_asr_id if task == "asr" else self.aura.task_cot_id
+        src_lang_id = LANG_MAP.get(src_lang, LANG_MAP["eng"])
 
-        prefix_ids = torch.tensor(
-            [self.aura.bos_id, tgt_lang_id, task_id],
-            dtype=torch.long, device=device,
+        # Prompt: [BOS, audio×N, <|transcribe|>, SRC_LANG]
+        # ASR and CoT share this prefix. The model then generates the transcript;
+        # for CoT it continues with <|translate|><tgt_lang> and translation.
+        bos_emb = embed_layer(
+            torch.tensor([self.aura.bos_id], dtype=torch.long, device=device)
         )
-        prefix_emb = embed_layer(prefix_ids)
-        audio_emb  = audio_embeds[0, :n_audio]
-        ts_emb = embed_layer(
-            torch.tensor([self.aura.transcript_start_id], dtype=torch.long, device=device)
+        audio_emb = audio_embeds[0, :n_audio]
+        transcribe_emb = embed_layer(
+            torch.tensor([self.aura.task_asr_id], dtype=torch.long, device=device)
+        )
+        src_lang_emb = embed_layer(
+            torch.tensor([src_lang_id], dtype=torch.long, device=device)
         )
 
-        inputs_embeds = torch.cat([prefix_emb, audio_emb, ts_emb], dim=0).unsqueeze(0)
+        inputs_embeds = torch.cat(
+            [bos_emb, audio_emb, transcribe_emb, src_lang_emb], dim=0
+        ).unsqueeze(0)
 
         S = inputs_embeds.size(1)
         position_ids = torch.arange(S, device=device).unsqueeze(0)
@@ -383,6 +417,8 @@ class SpeechAura(nn.Module):
         generated  = []
         next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
+        # ASR: stop at <|translate|> (boundary into translation) or EOS.
+        # CoT: stop only at EOS — <|translate|> is part of the expected output.
         stop_ids = {self.aura.eos_id}
         if task == "asr":
             stop_ids.add(self.aura.translate_start_id)
