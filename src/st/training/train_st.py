@@ -8,6 +8,22 @@ Stage 4: Train everything (encoder + projector + full LLM).
 Controlled entirely by the experiment YAML — no code changes needed to
 switch stages.
 
+Resume semantics
+----------------
+meta.json now persists three position fields:
+  - step               : global optimizer-step count
+  - epoch              : which sampler epoch was active when the checkpoint
+                         was saved
+  - batches_into_epoch : per-rank micro-batches consumed in that epoch at
+                         save time (counts micro-batches, not optimizer
+                         steps — this is the granularity at which the
+                         sampler advances)
+
+On resume, set_epoch(epoch) rebuilds the identical shuffled batch list, then
+skip(batches_into_epoch) advances past already-consumed batches. OOM-skipped
+batches DO count toward batches_into_epoch (they were drawn from the sampler
+even though their gradients were thrown away).
+
 Single GPU:
     PYTHONPATH=src python -m st.training.train_st \
         --config configs/experiment/stage3.yaml
@@ -31,7 +47,6 @@ import csv
 import gc
 import logging
 import os
-import time
 from pathlib import Path
 
 import torch
@@ -127,8 +142,15 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler,
     path: str,
-) -> int:
-    """Load checkpoint directory into raw (unwrapped) model. Returns step."""
+) -> tuple[int, int, int]:
+    """Load checkpoint directory into raw (unwrapped) model.
+
+    Returns:
+        (step, epoch, batches_into_epoch). Old checkpoints without epoch /
+        batches_into_epoch fields default to (step, 0, 0), which means resume
+        will reshuffle from epoch 0 — forward progress is fine but not
+        bit-exact to what the original run would have done.
+    """
     import json
 
     model.load_checkpoint(path)
@@ -148,14 +170,28 @@ def load_checkpoint(
         log.info(f"Loaded scheduler state ← {sch_path}")
 
     meta_path = f"{path}/meta.json"
-    step = 0
+    step               = 0
+    epoch              = 0
+    batches_into_epoch = 0
     if os.path.exists(meta_path):
         with open(meta_path) as f:
             meta = json.load(f)
-        step = meta.get("step", 0)
+        step               = meta.get("step", 0)
+        epoch              = meta.get("epoch", 0)
+        batches_into_epoch = meta.get("batches_into_epoch", 0)
 
-    log.info(f"Resumed from {path} at step {step}")
-    return step
+        if "epoch" not in meta:
+            log.warning(
+                f"Checkpoint {path} predates epoch/batches_into_epoch tracking; "
+                f"resume will restart sampler at epoch=0 (forward progress only, "
+                f"not bit-exact replay)."
+            )
+
+    log.info(
+        f"Resumed from {path} at step {step} "
+        f"(epoch={epoch}, batches_into_epoch={batches_into_epoch})"
+    )
+    return step, epoch, batches_into_epoch
 
 
 def save_checkpoint(
@@ -163,6 +199,8 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler,
     step: int,
+    epoch: int,
+    batches_into_epoch: int,
     output_dir: str,
 ) -> str:
     """Save checkpoint. Must only be called on master rank."""
@@ -180,11 +218,16 @@ def save_checkpoint(
     if os.path.exists(meta_path):
         with open(meta_path) as f:
             meta = json.load(f)
-    meta["step"] = step
+    meta["step"]               = step
+    meta["epoch"]              = epoch
+    meta["batches_into_epoch"] = batches_into_epoch
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
 
-    log.info(f"Checkpoint saved → {ckpt_dir}")
+    log.info(
+        f"Checkpoint saved → {ckpt_dir} "
+        f"(step={step}, epoch={epoch}, batches_into_epoch={batches_into_epoch})"
+    )
     return ckpt_dir
 
 
@@ -199,8 +242,10 @@ def build_val_generate_indices(
     """Return the first `samples_per_lang` indices per language. Deterministic."""
     from collections import defaultdict
     lang_indices: dict[str, list[int]] = defaultdict(list)
-    for idx, entry in enumerate(val_ds.entries):
-        lang = entry.get("language") or entry.get("src_language") or "?"
+    # Read directly from the columnar array — avoids materializing dicts via _EntriesView
+    src_langs = val_ds._src_languages
+    for idx in range(len(val_ds)):
+        lang = src_langs[idx] or "?"
         if len(lang_indices[lang]) < samples_per_lang:
             lang_indices[lang].append(idx)
 
@@ -468,7 +513,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
     )
 
     # Synchronized bucket sampler: shared seed for bucket ORDER (all ranks),
-    # per-rank seed for sample ORDER within buckets (preserves data parallelism)
+    # per-rank slice for data parallelism
     train_sampler = DurationBucketSampler(
         dataset=train_ds,
         target_duration=train_cfg.get("max_batch_duration", 120.0),
@@ -484,18 +529,17 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                  f"(world_size={world_size}, effective_batch ≈ "
                  f"{train_cfg.get('max_batch_duration', 120.0) * world_size:.0f}s/step)")
 
+    num_workers = train_cfg.get("num_workers", 4)
     train_loader = DataLoader(
         train_ds,
         batch_sampler=train_sampler,
-        num_workers=train_cfg.get("num_workers", 4),
+        num_workers=num_workers,
         collate_fn=collator,
         pin_memory=True,
+        persistent_workers=num_workers > 0,
     )
 
     # Validation: only master runs evaluate(), so only master needs val_loader.
-    # The loader is built over a bounded subset (val_samples_per_lang per
-    # language) — full val sets can be millions of rows, so even a batched
-    # loss pass is too slow.
     val_loader = None
     val_generate_indices: list[int] = []
     if master and val_ds is not None:
@@ -507,7 +551,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         val_subset = Subset(val_ds, val_generate_indices)
         # DurationBucketSampler reads .durations directly; Subset doesn't
         # forward attribute access, so attach it manually.
-        val_subset.durations = [val_ds.durations[i] for i in val_generate_indices]
+        val_subset.durations = [float(val_ds.durations[i]) for i in val_generate_indices]
 
         val_sampler = DurationBucketSampler(
             dataset=val_subset,
@@ -519,9 +563,10 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         val_loader = DataLoader(
             val_subset,
             batch_sampler=val_sampler,
-            num_workers=train_cfg.get("num_workers", 4),
+            num_workers=num_workers,
             collate_fn=collator,
             pin_memory=True,
+            persistent_workers=num_workers > 0,
         )
 
     # ---- Optimizer ----
@@ -548,10 +593,16 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
     )
 
     # ---- Resume ----
-    # Load on all ranks so weights + optimizer state are identical everywhere
-    start_step = 0
+    # Load on all ranks so weights + optimizer state are identical everywhere.
+    # raw_model is the unwrapped model — DDP wrapping happened above, but
+    # load_checkpoint operates on the underlying SpeechAura via raw_model.
+    start_step           = 0
+    start_epoch          = 0
+    start_batch_in_epoch = 0
     if resume_from:
-        start_step = load_checkpoint(raw_model, optimizer, scheduler, resume_from)
+        start_step, start_epoch, start_batch_in_epoch = load_checkpoint(
+            raw_model, optimizer, scheduler, resume_from,
+        )
 
     # ---- W&B — master only ----
     use_wandb = not train_cfg.get("no_wandb", False)
@@ -573,9 +624,11 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
 
     # ---- Training loop ----
     model.train()
-    global_step  = start_step
-    epoch        = 0
-    grad_accum   = train_cfg.get("grad_accum", 8)
+    global_step      = start_step
+    epoch            = start_epoch
+    batches_in_epoch = start_batch_in_epoch
+
+    grad_accum   = train_cfg.get("grad_accum", 1)
     log_every    = train_cfg.get("log_every", 100)
     save_every   = train_cfg.get("save_every", 5000)
     eval_every   = train_cfg.get("eval_every", 5000)
@@ -586,7 +639,6 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
     micro_step = 0
 
     from tqdm import tqdm
-    # Only master shows the progress bar
     pbar = tqdm(
         total=max_steps - start_step,
         desc="Training",
@@ -596,15 +648,25 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
     )
 
     if master:
-        log.info(f"Training for {max_steps} steps (resuming from {start_step})")
+        log.info(
+            f"Training for {max_steps} steps (resuming from step={start_step}, "
+            f"epoch={start_epoch}, batches_into_epoch={start_batch_in_epoch})"
+        )
     optimizer.zero_grad()
 
+    # Outer loop: each iteration consumes one (possibly partial-on-resume) epoch.
+    # We do NOT pre-increment `epoch` — the first pass replays the same epoch
+    # number we were saved in, then bumps at the bottom after the for-loop
+    # exhausts naturally.
     while global_step < max_steps:
-        epoch += 1
-
-        # Advance the sampler RNG at the start of each epoch so all ranks
-        # stay synchronized on bucket order while seeing different samples
         train_sampler.set_epoch(epoch)
+        if batches_in_epoch > 0:
+            train_sampler.skip(batches_in_epoch)
+            if master:
+                log.info(
+                    f"Resuming epoch {epoch}: skipping {batches_in_epoch} batches "
+                    f"(out of {len(train_sampler)} per-rank batches this epoch)"
+                )
 
         for batch in train_loader:
             # Synchronize cooldown across ranks
@@ -613,7 +675,13 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                 dist.all_reduce(cooldown_tensor, op=dist.ReduceOp.MAX)
                 oom_cooldown = int(cooldown_tensor.item())
 
+            # A batch was drawn from the sampler — advance position regardless
+            # of whether we end up processing it. Two cases where we skip the
+            # body but still count the batch as consumed:
+            #   1. collator returned None (all samples dropped by max_target_tokens)
+            #   2. we're in OOM cooldown
             if batch is None or oom_cooldown > 0:
+                batches_in_epoch += 1
                 oom_cooldown = max(0, oom_cooldown - 1)
                 continue
 
@@ -652,13 +720,16 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                 micro_step = (micro_step // grad_accum) * grad_accum
                 running = {k: 0.0 for k in running}
                 run_n = 0
+                # The OOM'd batch was drawn from the sampler — count it as consumed.
+                batches_in_epoch += 1
                 continue
 
             # Accumulate unscaled metrics
             for k in ("loss", "ce_loss", "ctc_loss"):
                 running[k] += out[k].item()
-            run_n      += 1
-            micro_step += 1
+            run_n            += 1
+            micro_step       += 1
+            batches_in_epoch += 1
 
             if micro_step % grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(trainable, 1.0)
@@ -685,17 +756,16 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                     and run_n > 0 and micro_step % grad_accum == 0:
                 
                 loss_for_log = out["loss"].detach().clone()
-                reduce_tensor(loss_for_log)  # both ranks participate
+                reduce_tensor(loss_for_log)  # all ranks participate
 
-                # Only master logs the result
                 if master:
-
                     avg    = {k: v / run_n for k, v in running.items()}
                     cur_lr = optimizer.param_groups[0]["lr"]
                     log.info(
                         f"step {global_step}/{max_steps} | "
                         + " | ".join(f"{k}={v:.4f}" for k, v in avg.items())
-                        + f" | lr={cur_lr:.2e} | bs={cur_bs} | dur={cur_dur:.0f}s"
+                        + f" | lr={cur_lr:.2e} | bs={cur_bs} | dur={cur_dur:.0f}s | "
+                        + f"ep={epoch} | bie={batches_in_epoch}"
                     )
                     if use_wandb:
                         import wandb
@@ -713,7 +783,10 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             if master and global_step > 0 \
                 and global_step % save_every == 0 \
                 and micro_step % grad_accum == 0:
-                save_checkpoint(raw_model, optimizer, scheduler, global_step, output_dir)
+                save_checkpoint(
+                    raw_model, optimizer, scheduler,
+                    global_step, epoch, batches_in_epoch, output_dir,
+                )
 
             # ---- Validation (master only) ----
             if master and val_loader is not None \
@@ -740,11 +813,18 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             if global_step >= max_steps:
                 break
 
+        # For-loop exhausted naturally → epoch complete. Bump and reset.
+        epoch += 1
+        batches_in_epoch = 0
+
     pbar.close()
 
     # ---- Final checkpoint and eval ----
     if master:
-        save_checkpoint(raw_model, optimizer, scheduler, global_step, output_dir)
+        save_checkpoint(
+            raw_model, optimizer, scheduler,
+            global_step, epoch, batches_in_epoch, output_dir,
+        )
 
         if val_loader is not None:
             metrics = evaluate(

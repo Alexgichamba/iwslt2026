@@ -10,17 +10,13 @@ Synchronized batches across ranks (Zelasko et al. 2025, ASRU):
     and to shuffle bucket order → all ranks build an IDENTICAL global
     batch list.
   - Each rank then takes batches[rank::world_size] as its slice.
-    → At step k, all ranks process audio from the same duration range
-      (eliminating the tail-worker effect).
-    → Each rank sees a disjoint subset of the data (true data parallelism).
-    → Every sample is seen exactly once per epoch across all ranks combined.
 
-This is a pre-built-list approximation of the paper's streaming-buffer
-approach. It gives up determinism-via-streaming and the concurrent-bucketing
-startup speedup, but achieves the same tail-worker fix and data-parallelism
-properties with a simpler mechanism.
-
-Requires the dataset to expose a .durations list (pre-extracted from CSV).
+Mid-epoch resume:
+  - Save `epoch` and `batches_consumed_this_epoch` in the training checkpoint.
+  - On resume, call `set_epoch(epoch)` to rebuild the identical batch list,
+    then call `skip(batches_consumed_this_epoch)` so the next __iter__ skips
+    those batches. The first epoch after resume is partial; subsequent
+    epochs are full.
 """
 
 from __future__ import annotations
@@ -35,17 +31,16 @@ class DurationBucketSampler(Sampler):
     """Batch sampler that caps total audio duration per batch.
 
     Args:
-        dataset:              Dataset with a `.durations` attribute (list[float]).
+        dataset:              Dataset with a `.durations` attribute (list[float]
+                              or np.ndarray).
         target_duration:      Max total audio seconds per batch.
-        max_batch_size:       Hard cap on instances per batch (prevents huge
-                              batches from many short utterances).
+        max_batch_size:       Hard cap on instances per batch.
         bucket_width:         Multiplier — samples within a bucket have durations
                               spanning at most [min, min * bucket_width].
         shuffle:              Shuffle samples within each bucket before batching.
         shuffle_buckets:      Shuffle bucket order each epoch.
         drop_last:            Drop the final incomplete batch per bucket.
-        rank:                 DDP rank (0 for single GPU). Used to slice the
-                              shared global batch list.
+        rank:                 DDP rank (0 for single GPU).
         world_size:           DDP world size (1 for single GPU).
         seed:                 Shared seed — must be identical on all ranks.
     """
@@ -74,11 +69,21 @@ class DurationBucketSampler(Sampler):
         self.world_size       = world_size
         self.seed             = seed
 
-        self.durations: list[float] = dataset.durations
+        # Accept both list and np.ndarray
+        durations = dataset.durations
+        if hasattr(durations, "tolist"):
+            self.durations: list[float] = durations.tolist()
+        else:
+            self.durations = list(durations)
 
         # Single shared RNG — same seed on all ranks → all ranks build
         # the same global batch list, then slice by rank.
         self._rng = random.Random(seed)
+        self._current_epoch = 0
+
+        # Mid-epoch resume: number of per-rank batches to skip in the next
+        # __iter__. Reset to 0 when the epoch completes naturally.
+        self._skip_batches = 0
 
         self._buckets     = self._make_buckets()
         self._all_batches = self._make_batches(self._buckets)
@@ -137,25 +142,27 @@ class DurationBucketSampler(Sampler):
 
     def __iter__(self) -> Iterator[list[int]]:
         # Step 1: Shuffle SAMPLES within each bucket using the SHARED RNG.
-        # All ranks produce identical bucket contents.
         buckets = [b.copy() for b in self._buckets]
         if self.shuffle:
             for b in buckets:
                 self._rng.shuffle(b)
 
-        # Step 2: Build batches from the (identically) shuffled buckets.
+        # Step 2: Build batches.
         batches = self._make_batches(buckets)
 
         # Step 3: Shuffle BATCH ORDER using the SHARED RNG.
-        # All ranks see the same order → at step k all ranks pull from
-        # the same duration range (paper's tail-worker fix).
         if self.shuffle_buckets:
             self._rng.shuffle(batches)
 
-        # Step 4: Slice for this rank. With identical global lists across
-        # ranks and an interleaved slice, every sample is covered exactly
-        # once per epoch and no two ranks see the same batch.
+        # Step 4: Slice for this rank.
         batches = batches[self.rank::self.world_size]
+
+        # Step 5: Mid-epoch resume — skip already-consumed batches, then clear
+        # the counter so the NEXT epoch starts fresh.
+        if self._skip_batches > 0:
+            batches = batches[self._skip_batches:]
+            self._skip_batches = 0
+
         yield from batches
 
     def __len__(self) -> int:
@@ -165,7 +172,23 @@ class DurationBucketSampler(Sampler):
         return (total + self.world_size - 1 - self.rank) // self.world_size
 
     def set_epoch(self, epoch: int) -> None:
-        """Call at the start of each epoch (like DistributedSampler).
+        """Call at the start of each epoch.
+
         Re-seeds the shared RNG deterministically so each epoch shuffles
-        differently but all ranks stay synchronized."""
+        differently but all ranks stay synchronized. Idempotent: calling
+        set_epoch(N) twice produces the same batch list.
+        """
+        self._current_epoch = epoch
         self._rng = random.Random(self.seed + epoch)
+
+    def skip(self, n_batches: int) -> None:
+        """Skip the first n_batches of the next __iter__ call (mid-epoch resume).
+
+        Must be called AFTER set_epoch(). Cleared automatically once __iter__
+        consumes it, so subsequent epochs are full.
+        """
+        self._skip_batches = max(0, int(n_batches))
+
+    @property
+    def current_epoch(self) -> int:
+        return self._current_epoch

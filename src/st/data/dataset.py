@@ -8,9 +8,16 @@ Index CSV columns (ASR):
 Index CSV columns (AST, superset):
     ... + translation, src_language, tgt_language
 
-The dataset is intentionally dumb — it just reads audio and returns mel
-features + text strings. All tokenization happens in the collator so the
-dataset stays reusable across training stages.
+Memory model
+------------
+With multi-worker DataLoader + DDP, naive `self.entries = [dict, dict, ...]`
+balloons RSS: each worker process forks a copy, and CPython refcount writes
+defeat copy-on-write. At 7.4M rows × 40 procs that's ~120GB just for index
+state.
+
+We store columns as numpy object arrays (str dtype=object) and primitive
+numpy arrays (durations, sample_rates). Numpy buffers stay in shared memory
+across forks because they don't carry per-element refcounts.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import soundfile as sf
 import torchaudio
@@ -44,8 +52,6 @@ class SpeechDataset(Dataset):
                           None = keep all rows.
         languages:        Keep only these language codes. None = keep all.
         sources:          Keep only these source names. None = keep all.
-        text_column:      Column to use as the primary text target.
-                          "transcript" for ASR, "translation" for AST.
         max_duration:     Drop utterances longer than this (seconds).
         min_duration:     Drop utterances shorter than this (seconds).
         sample_rate:      Resample all audio to this rate.
@@ -76,16 +82,71 @@ class SpeechDataset(Dataset):
 
         effective_src = src_languages if src_languages is not None else languages
 
-        self.entries: list[dict[str, str]] = self._load_index(
+        # Load CSV → list of dicts (transient). Immediately convert to columnar
+        # numpy arrays and drop the list of dicts before workers fork.
+        entries = self._load_index(
             index_path, split, task, effective_src, tgt_languages,
             sources, min_duration, max_duration,
         )
 
-        # Pre-extract durations for DurationBucketSampler (avoids probing files at runtime)
-        self.durations: list[float] = [
-            float(e["duration"]) if e.get("duration") else max_duration
-            for e in self.entries
-        ]
+        n = len(entries)
+        # Columnar storage. Object arrays for strings (still Python str objects,
+        # but stored contiguously in one numpy buffer rather than 7M dict slots).
+        self._paths        = np.array(
+            [e.get("path") or e.get("audio_path") or "" for e in entries],
+            dtype=object,
+        )
+        self._audio_ids    = np.array(
+            [e.get("audio_id", "") for e in entries],
+            dtype=object,
+        )
+        self._transcripts  = np.array(
+            [e.get("transcript", "") for e in entries],
+            dtype=object,
+        )
+        self._sources      = np.array(
+            [e.get("source", "") for e in entries],
+            dtype=object,
+        )
+        self._src_languages = np.array(
+            [e.get("language") or e.get("src_language") or "" for e in entries],
+            dtype=object,
+        )
+
+        # Only needed in CoT mode — skip allocating for ASR-only runs.
+        if task == "cot":
+            self._translations  = np.array(
+                [e.get("translation", "") for e in entries],
+                dtype=object,
+            )
+            self._tgt_languages = np.array(
+                [e.get("tgt_language", "english") for e in entries],
+                dtype=object,
+            )
+        else:
+            self._translations  = None
+            self._tgt_languages = None
+
+        # Primitive numeric arrays — these are truly shared-memory across forks.
+        self._sample_rates = np.array(
+            [int(float(e["sample_rate"])) if e.get("sample_rate", "").strip() else 0
+             for e in entries],
+            dtype=np.int32,
+        )
+        self.durations: np.ndarray = np.array(
+            [float(e["duration"]) if e.get("duration") else max_duration
+             for e in entries],
+            dtype=np.float32,
+        )
+
+        # Compatibility: code elsewhere (e.g. build_val_generate_indices) treats
+        # entries as iterable to read `language`/`src_language` per row. Provide
+        # a lazy view that returns a minimal dict per index instead of holding
+        # the original list.
+        self.entries = _EntriesView(self)
+
+        # Drop the heavy list of dicts BEFORE any workers spawn.
+        del entries
 
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=sample_rate,
@@ -95,14 +156,12 @@ class SpeechDataset(Dataset):
         )
 
         # Log summary
-        lang_counts: dict[str, int] = {}
-        for e in self.entries:
-            lang = e.get("language") or e.get("src_language") or "?"
-            lang_counts[lang] = lang_counts.get(lang, 0) + 1
+        unique_langs, counts = np.unique(self._src_languages, return_counts=True)
+        lang_counts = dict(zip(unique_langs.tolist(), counts.tolist()))
 
-        total_hours = sum(self.durations) / 3600
+        total_hours = float(self.durations.sum()) / 3600
         log.info(
-            f"SpeechDataset: {len(self.entries)} examples from {index_path} "
+            f"SpeechDataset: {n} examples from {index_path} "
             f"[split={split}, {total_hours:.1f}h]"
         )
         log.info(f"  Languages: {lang_counts}")
@@ -181,26 +240,24 @@ class SpeechDataset(Dataset):
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
-        return len(self.entries)
+        return len(self._paths)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         # Retry up to 10 neighbors on load failure (corrupt / missing audio)
         for offset in range(10):
-            actual = (idx + offset) % len(self.entries)
+            actual = (idx + offset) % len(self)
             try:
                 return self._load_sample(actual)
             except Exception as exc:
                 if offset == 0:
-                    e = self.entries[actual]
                     log.warning(
-                        f"Failed to load {e.get('audio_id', '?')} "
-                        f"({e.get('path', '?')}): {exc}"
+                        f"Failed to load {self._audio_ids[actual]} "
+                        f"({self._paths[actual]}): {exc}"
                     )
         raise RuntimeError(f"Could not load any sample near index {idx}")
 
     def _load_sample(self, idx: int) -> dict[str, Any]:
-        entry      = self.entries[idx]
-        audio_path = entry.get("path") or entry.get("audio_path") or ""
+        audio_path = self._paths[idx]
 
         data, sr = sf.read(audio_path, dtype="float32")
         if data.ndim > 1:
@@ -208,9 +265,9 @@ class SpeechDataset(Dataset):
         waveform = torch.from_numpy(data)
 
         # Use index sample_rate when available (avoids soundfile header re-read)
-        sr_str = entry.get("sample_rate", "").strip()
-        if sr_str:
-            sr = int(float(sr_str))
+        idx_sr = int(self._sample_rates[idx])
+        if idx_sr > 0:
+            sr = idx_sr
 
         if sr != self.sample_rate:
             waveform = AF.resample(waveform, sr, self.sample_rate)
@@ -223,10 +280,9 @@ class SpeechDataset(Dataset):
         mel = torch.clamp(mel, min=1e-10).log10()
         mel = mel.T                                       # (T, 80)
 
-        # Source language (always present in both ASR and AST CSVs)
-        src_language = entry.get("language") or entry.get("src_language") or ""
+        src_language = self._src_languages[idx]
 
-        transcript = entry.get("transcript", "")
+        transcript = self._transcripts[idx]
         if self.lowercase:
             transcript = transcript.lower()
 
@@ -234,13 +290,13 @@ class SpeechDataset(Dataset):
             translation  = ""
             tgt_language = src_language
         else:  # cot
-            translation = entry.get("translation", "")
+            translation = self._translations[idx]
             if self.lowercase:
                 translation = translation.lower()
-            tgt_language = entry.get("tgt_language", "english")
+            tgt_language = self._tgt_languages[idx]
 
         return {
-            "audio_id":     entry.get("audio_id", ""),
+            "audio_id":     self._audio_ids[idx],
             "mel":          mel,
             "mel_len":      mel.size(0),
             "transcript":   transcript,
@@ -248,5 +304,41 @@ class SpeechDataset(Dataset):
             "src_language": src_language,
             "tgt_language": tgt_language,
             "task":         self.task,
-            "source":       entry.get("source", ""),
+            "source":       self._sources[idx],
         }
+
+
+class _EntriesView:
+    """Lazy backward-compat view: dataset.entries[i] returns a minimal dict.
+
+    Some helpers (build_val_generate_indices) iterate dataset.entries to bucket
+    indices by language. We don't want to keep the original list of dicts
+    around, so we synthesize per-row dicts on demand from the columnar arrays.
+    """
+
+    def __init__(self, ds: SpeechDataset):
+        self._ds = ds
+
+    def __len__(self) -> int:
+        return len(self._ds)
+
+    def __getitem__(self, idx: int) -> dict[str, str]:
+        ds = self._ds
+        d = {
+            "audio_id":     ds._audio_ids[idx],
+            "path":         ds._paths[idx],
+            "transcript":   ds._transcripts[idx],
+            "language":     ds._src_languages[idx],
+            "src_language": ds._src_languages[idx],
+            "source":       ds._sources[idx],
+            "duration":     str(float(ds.durations[idx])),
+            "sample_rate":  str(int(ds._sample_rates[idx])),
+        }
+        if ds._translations is not None:
+            d["translation"]  = ds._translations[idx]
+            d["tgt_language"] = ds._tgt_languages[idx]
+        return d
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
