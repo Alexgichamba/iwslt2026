@@ -57,7 +57,8 @@ def run_inference(
     cfg: dict,
     checkpoint: str,
     audio_path: str,
-    language: str,
+    src_language: str,
+    tgt_language: str,
     task: str,
     max_new_tokens: int = 256,
     device_str: str = "cuda",
@@ -73,7 +74,8 @@ def run_inference(
         output = model.generate(
             audio_features=mel,
             audio_lengths=mel_len,
-            target_lang=language,
+            src_lang=src_language,
+            tgt_lang=tgt_language,
             task=task,
             max_new_tokens=max_new_tokens,
         )
@@ -92,7 +94,8 @@ def main() -> None:
     parser.add_argument("--config",         required=True,  help="Experiment YAML config")
     parser.add_argument("--checkpoint",     required=True,  help="Checkpoint directory")
     parser.add_argument("--audio",          required=True,  help="Audio file path")
-    parser.add_argument("--language",       required=True,  help="Source language code (e.g. igbo)")
+    parser.add_argument("--src_language",   required=True,  help="Source language code (e.g. igbo)")
+    parser.add_argument("--tgt_language", default="english", help="Target language for CoT (ignored for ASR)")
     parser.add_argument("--task",           default="asr", choices=["asr", "cot"])
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--device",         default="cuda")
@@ -103,7 +106,8 @@ def main() -> None:
         cfg=cfg,
         checkpoint=args.checkpoint,
         audio_path=args.audio,
-        language=args.language,
+        src_language=args.src_language,
+        tgt_language=args.tgt_language,
         task=args.task,
         max_new_tokens=args.max_new_tokens,
         device_str=args.device,
@@ -112,7 +116,10 @@ def main() -> None:
     sep = "=" * 60
     print(f"\n{sep}")
     print(f"Audio:    {args.audio}")
-    print(f"Language: {args.language}  |  Task: {args.task}")
+    if args.task == "cot":
+        print(f"Source: {args.src_language}  |  Target: {args.tgt_language}  |  Task: {args.task}")
+    else:
+        print(f"Source: {args.src_language}  |  Task: {args.task}")
     print(f"{sep}")
     print(f"Transcript:  {output['transcript']}")
     if "translation" in output:

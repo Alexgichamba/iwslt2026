@@ -266,59 +266,86 @@ def build_val_generate_indices(
 @torch.no_grad()
 def evaluate(
     model: SpeechAura,
-    val_loader: DataLoader,
+    val_loader: DataLoader | None,
     device: torch.device,
     task: str,
     val_generate_indices: list[int],
+    val_ds: SpeechDataset,
+    rank: int = 0,
+    world_size: int = 1,
+    is_ddp: bool = False,
     step: int = 0,
     output_dir: str | None = None,
 ) -> dict[str, float]:
-    """Run validation on the raw (unwrapped) model.
+    """Sharded validation. All ranks must call this together.
 
-    Called on master rank only — no DDP communication here.
-    Both loss and generation are restricted to `val_generate_indices`
-    (~N_languages × val_samples_per_lang). val_loader must already be
-    built over the bounded subset.
+    Each rank generates its slice of val_generate_indices, then gathers
+    hyps/refs to rank 0 for metric computation. Only rank 0 returns
+    populated results; other ranks return an empty dict.
+
+    The loss pass currently runs on rank 0 only — it iterates a Subset-backed
+    DataLoader that exists only on rank 0. Generation is the expensive part
+    and is the one being sharded.
+
+    Args:
+        val_loader:           Loss-pass loader. Built only on rank 0; pass
+                              None on other ranks.
+        val_generate_indices: Full list of indices into val_ds. Must be
+                              identical on every rank — broadcast before
+                              calling this if necessary.
+        val_ds:               Underlying full validation dataset. Required
+                              on every rank for per-sample generation.
     """
     from collections import defaultdict
     from tqdm import tqdm
 
     model.eval()
-    total_loss, n = 0.0, 0
+    master = (rank == 0)
+    results: dict[str, float] = {}
 
-    for batch in val_loader:
-        if batch is None:
-            continue
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                 for k, v in batch.items()}
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16,
-                                enabled=(device.type == "cuda")):
-            out = model(**batch)
-        total_loss += out["loss"].item()
-        n += 1
+    # ---- Loss pass (master only — uses Subset loader on rank 0) ----
+    if master and val_loader is not None:
+        total_loss, n = 0.0, 0
+        for batch in val_loader:
+            if batch is None:
+                continue
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                     for k, v in batch.items()}
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                    enabled=(device.type == "cuda")):
+                out = model(**batch)
+            total_loss += out["loss"].item()
+            n += 1
+        results["loss"] = total_loss / max(n, 1)
+        torch.cuda.empty_cache()
 
-    results: dict[str, float] = {"loss": total_loss / max(n, 1)}
-    torch.cuda.empty_cache()
+    # ---- Generation pass (sharded across ranks) ----
+    # Interleaved slice: rank 0 gets indices 0, W, 2W, ...; rank 1 gets 1, W+1, ...
+    # This keeps each rank's per-language sample distribution roughly uniform.
+    my_indices = val_generate_indices[rank::world_size]
 
-    # val_loader.dataset is a Subset over val_generate_indices; per-sample
-    # generation reads the underlying full dataset at the original indices.
-    val_ds = val_loader.dataset
-    if hasattr(val_ds, "dataset"):
-        val_ds = val_ds.dataset
-    src_langs_seen: list[str] = []
-    hyp_transcripts:  list[str] = []
-    ref_transcripts:  list[str] = []
-    hyp_translations: list[str] = []
-    ref_translations: list[str] = []
+    my_idx_seen:      list[int] = []
+    my_src_langs:     list[str] = []
+    my_hyp_t:         list[str] = []
+    my_ref_t:         list[str] = []
+    my_hyp_r:         list[str] = []
+    my_ref_r:         list[str] = []
 
-    for idx in tqdm(val_generate_indices, desc="Generating val", unit="sample", dynamic_ncols=True):
+    for idx in tqdm(
+        my_indices,
+        desc=f"Generating val (rank {rank})",
+        unit="sample",
+        dynamic_ncols=True,
+        disable=not master,  # only master shows the bar; all ranks do the work
+    ):
         sample  = val_ds[idx]
         mel     = sample["mel"].unsqueeze(0).to(device)
         mel_len = torch.tensor([sample["mel_len"]], device=device)
         try:
             output = model.generate(
                 mel, mel_len,
-                target_lang=sample["tgt_language"],
+                src_lang=sample["src_language"],
+                tgt_lang=sample["tgt_language"],
                 task=task,
                 max_new_tokens=256 if task == "cot" else 128,
             )
@@ -327,19 +354,70 @@ def evaluate(
                 hyp_r = ""
             else:
                 hyp_t, hyp_r = model.split_cot_output(output)
-            hyp_transcripts.append(hyp_t)
-            hyp_translations.append(hyp_r)
         except Exception as e:
-            log.warning(f"generate() failed for sample {idx}: {e}")
-            hyp_transcripts.append("")
-            hyp_translations.append("")
+            log.warning(f"[rank {rank}] generate() failed for sample {idx}: {e}")
+            hyp_t = ""
+            hyp_r = ""
 
-        ref_transcripts.append(sample["transcript"].strip())
-        ref_translations.append(sample.get("translation", "").strip())
-        src_langs_seen.append(sample["src_language"])
+        my_idx_seen.append(idx)
+        my_src_langs.append(sample["src_language"])
+        my_hyp_t.append(hyp_t)
+        my_ref_t.append(sample["transcript"].strip())
+        my_hyp_r.append(hyp_r)
+        my_ref_r.append(sample.get("translation", "").strip())
 
         del mel, mel_len
         torch.cuda.empty_cache()
+
+    # ---- Gather to rank 0 ----
+    local_payload = {
+        "idx":   my_idx_seen,
+        "lang":  my_src_langs,
+        "hyp_t": my_hyp_t,
+        "ref_t": my_ref_t,
+        "hyp_r": my_hyp_r,
+        "ref_r": my_ref_r,
+    }
+
+    if is_ddp:
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, local_payload)
+    else:
+        gathered = [local_payload]
+
+    # ---- Metric computation (master only) ----
+    if not master:
+        model.train()
+        return {}
+
+    # Flatten gathered payloads and re-sort by original idx so the CSV and
+    # bucketing match the deterministic order from build_val_generate_indices.
+    all_idx:    list[int] = []
+    all_lang:   list[str] = []
+    all_hyp_t:  list[str] = []
+    all_ref_t:  list[str] = []
+    all_hyp_r:  list[str] = []
+    all_ref_r:  list[str] = []
+    for payload in gathered:
+        all_idx   .extend(payload["idx"])
+        all_lang  .extend(payload["lang"])
+        all_hyp_t .extend(payload["hyp_t"])
+        all_ref_t .extend(payload["ref_t"])
+        all_hyp_r .extend(payload["hyp_r"])
+        all_ref_r .extend(payload["ref_r"])
+
+    order = sorted(range(len(all_idx)), key=lambda i: all_idx[i])
+    src_langs_seen   = [all_lang [i] for i in order]
+    hyp_transcripts  = [all_hyp_t[i] for i in order]
+    ref_transcripts  = [all_ref_t[i] for i in order]
+    hyp_translations = [all_hyp_r[i] for i in order]
+    ref_translations = [all_ref_r[i] for i in order]
+    sorted_idx       = [all_idx  [i] for i in order]
+
+    log.info(
+        f"Gathered {len(hyp_transcripts)} val samples from {world_size} rank(s) "
+        f"(expected {len(val_generate_indices)})"
+    )
 
     if hyp_transcripts:
         lang_hyp_t: dict[str, list[str]] = defaultdict(list)
@@ -404,21 +482,23 @@ def evaluate(
                 if task == "asr":
                     writer.writerow(["idx", "src_lang", "ref_transcript",
                                      "hyp_transcript", "wer"])
-                    for i, (lang, r, h, w) in enumerate(zip(
-                        src_langs_seen, ref_transcripts, hyp_transcripts, per_sample_wer,
-                    )):
-                        writer.writerow([i, lang, r, h, f"{w:.4f}"])
+                    for orig_idx, lang, r, h, w in zip(
+                        sorted_idx, src_langs_seen, ref_transcripts,
+                        hyp_transcripts, per_sample_wer,
+                    ):
+                        writer.writerow([orig_idx, lang, r, h, f"{w:.4f}"])
                 else:
                     writer.writerow([
                         "idx", "src_lang",
                         "ref_transcript", "hyp_transcript", "wer",
                         "ref_translation", "hyp_translation",
                     ])
-                    for i, (lang, r_t, h_t, w, r_r, h_r) in enumerate(zip(
-                        src_langs_seen, ref_transcripts, hyp_transcripts, per_sample_wer,
+                    for orig_idx, lang, r_t, h_t, w, r_r, h_r in zip(
+                        sorted_idx, src_langs_seen, ref_transcripts,
+                        hyp_transcripts, per_sample_wer,
                         ref_translations, hyp_translations,
-                    )):
-                        writer.writerow([i, lang, r_t, h_t, f"{w:.4f}", r_r, h_r])
+                    ):
+                        writer.writerow([orig_idx, lang, r_t, h_t, f"{w:.4f}", r_r, h_r])
             log.info(f"Val predictions saved → {csv_path} ({len(hyp_transcripts)} samples)")
 
     gc.collect()
@@ -539,35 +619,39 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         persistent_workers=num_workers > 0,
     )
 
-    # Validation: only master runs evaluate(), so only master needs val_loader.
     val_loader = None
     val_generate_indices: list[int] = []
-    if master and val_ds is not None:
-        from torch.utils.data import Subset
-
+    if val_ds is not None:
         samples_per_lang = train_cfg.get("val_samples_per_lang", 100)
-        val_generate_indices = build_val_generate_indices(val_ds, samples_per_lang)
 
-        val_subset = Subset(val_ds, val_generate_indices)
-        # DurationBucketSampler reads .durations directly; Subset doesn't
-        # forward attribute access, so attach it manually.
-        val_subset.durations = [float(val_ds.durations[i]) for i in val_generate_indices]
+        if master:
+            val_generate_indices = build_val_generate_indices(val_ds, samples_per_lang)
 
-        val_sampler = DurationBucketSampler(
-            dataset=val_subset,
-            target_duration=train_cfg.get("max_batch_duration", 120.0),
-            max_batch_size=train_cfg.get("max_batch_size", 64),
-            shuffle=False,
-            shuffle_buckets=False,
-        )
-        val_loader = DataLoader(
-            val_subset,
-            batch_sampler=val_sampler,
-            num_workers=num_workers,
-            collate_fn=collator,
-            pin_memory=True,
-            persistent_workers=num_workers > 0,
-        )
+        # Broadcast the indices list so every rank has the same shard input.
+        if is_ddp:
+            obj_list = [val_generate_indices if master else None]
+            dist.broadcast_object_list(obj_list, src=0)
+            val_generate_indices = obj_list[0]
+
+        if master:
+            from torch.utils.data import Subset
+            val_subset = Subset(val_ds, val_generate_indices)
+            val_subset.durations = [float(val_ds.durations[i]) for i in val_generate_indices]
+            val_sampler = DurationBucketSampler(
+                dataset=val_subset,
+                target_duration=train_cfg.get("max_batch_duration", 120.0),
+                max_batch_size=train_cfg.get("max_batch_size", 64),
+                shuffle=False,
+                shuffle_buckets=False,
+            )
+            val_loader = DataLoader(
+                val_subset,
+                batch_sampler=val_sampler,
+                num_workers=num_workers,
+                collate_fn=collator,
+                pin_memory=True,
+                persistent_workers=num_workers > 0,
+            )
 
     # ---- Optimizer ----
     trainable = [p for p in model.parameters() if p.requires_grad]
@@ -780,16 +864,22 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                     run_n   = 0
 
             # ---- Checkpoint (master only) ----
-            if master and global_step > 0 \
-                and global_step % save_every == 0 \
-                and micro_step % grad_accum == 0:
-                save_checkpoint(
-                    raw_model, optimizer, scheduler,
-                    global_step, epoch, batches_in_epoch, output_dir,
-                )
+            # All ranks evaluate the predicate together
+            should_save = (
+                global_step > 0
+                and global_step % save_every == 0
+                and micro_step % grad_accum == 0
+            )
+            if should_save:
+                if master:
+                    save_checkpoint(
+                        raw_model, optimizer, scheduler,
+                        global_step, epoch, batches_in_epoch, output_dir,
+                    )
+                barrier()  # all ranks wait so non-master doesn't race ahead
 
-            # ---- Validation (master only) ----
-            if master and val_loader is not None \
+            # ---- Validation (ALL ranks must enter for the sharded generate to work) ----
+            if val_ds is not None \
                 and global_step > 0 \
                 and global_step % eval_every == 0 \
                 and micro_step % grad_accum == 0:
@@ -798,17 +888,20 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                 metrics = evaluate(
                     raw_model, val_loader, device, task,
                     val_generate_indices=val_generate_indices,
+                    val_ds=val_ds,
+                    rank=rank, world_size=world_size, is_ddp=is_ddp,
                     step=global_step, output_dir=output_dir,
                 )
-                log.info(
-                    f"step {global_step} val | "
-                    + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
-                )
-                if use_wandb:
-                    import wandb
-                    wandb.log({f"val/{k}": v for k, v in metrics.items()},
-                              step=global_step)
-                model.train()  # restore train mode after evaluate()
+                if master:
+                    log.info(
+                        f"step {global_step} val | "
+                        + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
+                    )
+                    if use_wandb:
+                        import wandb
+                        wandb.log({f"val/{k}": v for k, v in metrics.items()},
+                                step=global_step)
+                model.train()  # all ranks restore train mode
 
             if global_step >= max_steps:
                 break
@@ -825,21 +918,31 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             raw_model, optimizer, scheduler,
             global_step, epoch, batches_in_epoch, output_dir,
         )
+    barrier()  # all ranks
 
-        if val_loader is not None:
-            metrics = evaluate(
-                raw_model, val_loader, device, task,
-                val_generate_indices=val_generate_indices,
-                step=global_step, output_dir=output_dir,
+    # ---- Validation (ALL ranks must enter for the sharded generate to work) ----
+    if val_ds is not None:
+        torch.cuda.empty_cache()
+        metrics = evaluate(
+            raw_model, val_loader, device, task,
+            val_generate_indices=val_generate_indices,
+            val_ds=val_ds,
+            rank=rank, world_size=world_size, is_ddp=is_ddp,
+            step=global_step, output_dir=output_dir,
+        )
+        if master:
+            log.info(
+                f"step {global_step} val | "
+                + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
             )
-            log.info("Final val | " + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
             if use_wandb:
                 import wandb
-                wandb.log({f"val/{k}": v for k, v in metrics.items()}, step=global_step)
+                wandb.log({f"val/{k}": v for k, v in metrics.items()},
+                        step=global_step)
 
-        if use_wandb:
-            import wandb
-            wandb.finish()
+    if use_wandb:
+        import wandb
+        wandb.finish()
 
     # All ranks wait here before tearing down
     barrier()
